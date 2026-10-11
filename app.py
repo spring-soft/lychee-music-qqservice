@@ -37,13 +37,14 @@ import base64
 import json
 import logging
 import os
+import re
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Query
-from fastapi.responses import PlainTextResponse
+from fastapi.responses import JSONResponse, PlainTextResponse
 
 from qqmusic_api import Client, Credential
 from qqmusic_api.core.exceptions import (
@@ -638,19 +639,71 @@ async def list_by_mode(mode: str = Query(...), limit: int = 30,
 # ---------------- 歌词 ----------------
 
 @app.get("/v1/lyric", response_class=PlainTextResponse)
-async def lyric(id: str = Query(...)) -> str:
-    """返回 LRC 文本。拿不到就返回空串（固件那边歌词页空白，不影响播放）。"""
+async def lyric(id: str = Query(...), format: str | None = None) -> Any:
+    """返回歌词。
+
+    默认给 **LRC 纯文本**（设备屏上的歌词页就吃这个）。
+    `?format=json` 给**归一化的 JSON** —— 网页控制台要的是这个格式：
+        {"synced": bool, "total": N, "lines": [{"t": 毫秒, "text": "..."}]}
+    ★ 为什么这个转换放服务端而不是设备端：LRC 解析要处理"一行多个时间标签"
+      `[00:12.34][01:20.00]词`、小数位数、`\r`、无时间轴的纯文本行……
+      在 Python 里十几行就写对，在 C 里要几十行还得自己管内存，不值得。
+    拿不到就返回空串 / 空 lines（设备歌词页空白，不影响播放）。
+    """
+    lrc = ""
     try:
         resp = await _state["client"].lyric.get_lyric(id)
         for attr in ("lyric", "lrc", "lyric_text", "content"):
             v = getattr(resp, attr, None)
             if isinstance(v, str) and v.strip():
-                return v
-        log.info("歌词接口没找到已知字段，dump: %s",
-                 list(resp.model_dump().keys()) if hasattr(resp, "model_dump") else "?")
+                lrc = v
+                break
+        else:
+            log.info("歌词接口没找到已知字段，dump: %s",
+                     list(resp.model_dump().keys()) if hasattr(resp, "model_dump") else "?")
     except Exception as e:                                   # noqa: BLE001
         log.warning("歌词失败 %s: %s", id, e)
-    return ""
+
+    if format != "json":
+        return lrc
+    return JSONResponse(_lrc_to_normalized(lrc))
+
+
+# 时间标签：[mm:ss.xx] / [mm:ss.xxx] / [mm:ss]
+_LRC_TAG = re.compile(r"\[(\d{1,3}):(\d{1,2})(?:[.:](\d{1,3}))?\]")
+
+
+def _lrc_to_normalized(lrc: str) -> dict[str, Any]:
+    """LRC → 网页要的归一化结构。
+
+    · 一行可能有**多个**时间标签（`[00:12.34][01:20.00]同一句词`）→ 每个都出一条
+    · 没有时间标签的行 → t=0，且整体标 synced=false（网页按"无时间轴歌词"渲染）
+    · 纯音乐/没歌词 → lines 为空、total=0
+    """
+    lines: list[dict[str, Any]] = []
+    synced = False
+    plain: list[str] = []
+    for raw in (lrc or "").splitlines():
+        raw = raw.rstrip("\r")
+        tags = list(_LRC_TAG.finditer(raw))
+        text = _LRC_TAG.sub("", raw).strip()
+        if tags:
+            if text:
+                synced = True
+                for m in tags:
+                    mm, ss = int(m.group(1)), int(m.group(2))
+                    frac = m.group(3) or "0"
+                    # 1 位=十分之一秒、2 位=百分之一、3 位=毫秒
+                    ms = int(frac.ljust(3, "0")[:3])
+                    lines.append({"t": mm * 60000 + ss * 1000 + ms, "text": text})
+        elif text:
+            # [ti:] [ar:] 这类元信息标签会被 _LRC_TAG 匹配掉；剩下的才是正文
+            if not raw.lstrip().startswith("["):
+                plain.append(text)
+    if not synced:
+        lines = [{"t": 0, "text": p} for p in plain]
+    lines.sort(key=lambda x: x["t"])
+    return {"synced": synced, "total": len(lines), "lines": lines}
 
 
 # ---------------- "我喜欢"（读 + 加；**不能删**，见 /v1/favorite 那段的说明） ----------------
