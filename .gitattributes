@@ -1,0 +1,9 @@
+# 这项目是给 Linux 容器用的：一律 LF，别让 git 在 checkout 时换成 CRLF。
+# （Dockerfile / compose / requirements 出现 CRLF 会导致构建或运行出奇怪错误。）
+* text=auto eol=lf
+
+# 这些是二进制，别做换行转换
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.ico binary

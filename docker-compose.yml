@@ -1,0 +1,37 @@
+# QQ 音乐 → ESP-Music 契约层
+#
+# 位置：设备（ESP32）拿这里当"另一个音乐源"，走我们自定义的 /v1/* 契约，
+#       而不是直接依赖 QQ 的接口 —— 上游怎么变都只改这个容器，固件不重刷。
+#
+# 端口 3210：避开 Navidrome(4533)、Immich(2283)、Homepage(3000)、Excalidraw(8088)、
+#            代理(7890)，也避开上游项目惯用的 3200。
+#
+# 常用命令（和 F:\wsl 下其它服务一样）：
+#   docker compose build          # 构建（改完 app.py 要重跑）
+#   docker compose up -d          # 起
+#   docker compose logs -f --tail 100
+#   curl http://localhost:3210/v1/health
+#
+# ⚠️ 构建走代理：本机 PyPI 直连也通，所以默认**不开**代理参数，免得代理没开时构建失败。
+#    真需要时（拉不动依赖）把下面 args 取消注释 ——
+#    ⚠️ 只在 build.args 里加，**别加到 environment**，否则 QQ 请求会走国外出口而全挂。
+
+services:
+  qqmusic:
+    build:
+      context: .
+      # args:
+      #   HTTP_PROXY: http://host.docker.internal:7890
+      #   HTTPS_PROXY: http://host.docker.internal:7890
+      #   NO_PROXY: localhost,127.0.0.1
+    image: esp-music/qqmusic:1.0
+    container_name: qqmusic
+    ports:
+      - "3210:3210"
+    volumes:
+      # 凭据（credential.json）落在宿主机，重建容器不用重新扫码
+      - "./data:/data"
+    environment:
+      # 只影响日志详细程度。⚠️ 千万不要在这里放 HTTP_PROXY/HTTPS_PROXY
+      LOG_LEVEL: info
+    restart: unless-stopped

@@ -1,0 +1,15 @@
+# ★ 凭据文件绝对不要进仓库 —— 它等于 QQ 账号的登录态
+data/
+credential.json
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
