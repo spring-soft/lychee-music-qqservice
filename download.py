@@ -29,9 +29,12 @@ Navidrome 默认每 1 分钟自己扫一次（这台机器的 navidrome.toml 没
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
+import logging
 import os
 import re
+import secrets
 import shutil
 import subprocess
 import time
@@ -54,6 +57,8 @@ DL_DIR = MUSIC_DIR / "QQ下载"
 #    这一条命令）把成品"装"进曲库。见 deploy/qqmusic-install-dl。
 STAGE_DIR = DATA_DIR / "dl_stage"
 INSTALL_HELPER = "/usr/local/bin/qqmusic-install-dl"
+# Navidrome 账号就在 player.json 的 nav 段里（跟播放器共用一份，不重复配置）
+CFG_PATH = DATA_DIR / "player.json"
 
 COVER_TMPL = "http://y.qq.com/music/photo_new/T002R300x300M000{mid}.jpg"
 QUEUE_MAX = 200          # 排队上限（每首 10~40MB，别一下排几千首）
@@ -319,7 +324,41 @@ async def _worker_loop() -> None:
         except Exception as e:                              # noqa: BLE001
             log.error("下载任务异常: %s", e)
             job.update(state="失败", err=str(e)[:120])
+        # 队列排空了 → 触发一次 Navidrome 扫描，让新歌**立刻**进库。
+        # 为什么不在每首后面都扫：批量下 60 首会白扫 60 次（每次都要遍历/stat 曲库）。
+        # 为什么还是要显式触发：Navidrome 自己有一套调度，但这台机器 4 核/376MB，
+        # 等它排到可能要一分钟，用户会以为"下载没成功"。
+        if not _queued:
+            ok = await _nav_scan()
+            last = _jobs[0] if _jobs else None
+            if last is not None and last.get("state") == "完成":
+                last["note"] = (last.get("note") or "") + (
+                    "，已触发曲库扫描" if ok else "，扫描触发失败（文件已就位）")
         await asyncio.sleep(0.5)
+
+
+async def _nav_scan() -> bool:
+    """调 Navidrome 的 startScan（用 player.json 里那套 nav 账号，本机 127.0.0.1）。"""
+    try:
+        cfg = json.loads(CFG_PATH.read_text("utf-8")) if CFG_PATH.exists() else {}
+        nav = cfg.get("nav") or {}
+        host = (nav.get("host") or "http://127.0.0.1:4533").rstrip("/")
+        user, pw = nav.get("user"), nav.get("password")
+        if not user or not pw or _http is None:
+            log.warning("没配 Navidrome 账号，跳过扫描触发")
+            return False
+        salt = secrets.token_hex(8)
+        tok = hashlib.md5((pw + salt).encode()).hexdigest()
+        params = {"u": user, "t": tok, "s": salt, "v": "1.16.1",
+                  "c": "esp-music-dl", "f": "json"}
+        r = await _http.get(host + "/rest/startScan.view", params=params, timeout=25)
+        j = r.json().get("subsonic-response") or {}
+        ok = (j.get("status") == "ok")
+        log.info("触发曲库扫描: %s %s", j.get("status"), "" if ok else j)
+        return ok
+    except Exception as e:                                  # noqa: BLE001
+        log.warning("触发曲库扫描失败（文件已经下好了，不影响）: %s", e)
+        return False
 
 
 # ----------------------------------------------------------------- 生命周期

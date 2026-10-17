@@ -275,7 +275,8 @@ input[type=range]::-moz-range-thumb{width:18px;height:18px;border-radius:50%;
    服务器播放器控制台（与 ESP 设备网页控制台同一套视觉/交互）
    ⚠️ 本服务没有鉴权，同网段能打开这个页面的人都能控制播放 —— 既有约定。
    ============================================================ */
-var S = { back: 1, gen: -1, modes: null, stat: null, dragging: false, volTimer: null };
+var S = { back: 1, gen: -1, modes: null, stat: null, dragging: false, volTimer: null,
+          modeOf: {}, backPending: null, backPendingAt: 0 };
 
 function $(id){ return document.getElementById(id); }
 function esc(s){ return String(s == null ? '' : s).replace(/[&<>"]/g, function(c){
@@ -375,10 +376,16 @@ function render(st){
       b.classList.toggle('on', b.dataset.mode === st.queue.mode_key);
     });
   }
-  var srcBack = (st.queue && st.queue.back >= 0 && st.source) ? st.queue.back : S.back;
-  Array.prototype.forEach.call(document.querySelectorAll('#tabs .tab.back'), function(b){
-    b.classList.toggle('on', (b.dataset.back|0) === srcBack);
-  });
+  /* 来源高亮：以"用户选中的来源"为准；切换请求在飞的时候不要被轮询改回去
+   * （这就是以前"点了没用、自己弹回来"的根因：轮询无条件按 st.queue.back 重刷） */
+  var playingBack = (st.queue && st.queue.back >= 0) ? (st.queue.back|0) : -1;
+  if (S.backPending != null){
+    if (playingBack === S.backPending) S.backPending = null;                 /* 切成功 */
+    else if (Date.now() - (S.backPendingAt || 0) > 15000) S.backPending = null; /* 超时放弃 */
+  } else if (playingBack >= 0){
+    S.back = playingBack;      /* 别处（ESP / 另一个页面）换了来源 → 跟着变 */
+  }
+  paintSrcTabs();
 
   var cov = $('cover'), sid = has ? (song.cover || '') : '';
   if (sid && S.coverId !== song.back + ':' + sid){
@@ -476,19 +483,63 @@ $('vol').addEventListener('input', function(){
 });
 
 /* 来源切换 */
-Array.prototype.forEach.call(document.querySelectorAll('#tabs .tab.back'), function(b){
-  b.onclick = function(){
-    S.back = b.dataset.back|0;
-    Array.prototype.forEach.call(document.querySelectorAll('#tabs .tab.back'), function(x){
-      x.classList.toggle('on', x === b);
+/* ---------------- 来源切换 ----------------
+ *
+ * ⚠️ 以前这里只改 S.back + 换一下模式列表，**根本没切**：
+ *    随后 1.2 秒的状态轮询看到"服务器实际还在放另一个来源"，就把高亮改回去 ——
+ *    用户看到的现象就是"点了没用、自己弹回来"。
+ * 现在：点来源 = 让服务器用这个来源的模式起播（真的切），
+ *       并且切换请求在飞的时候（backPending）不许轮询把高亮改回去。
+ */
+function paintSrcTabs(){
+  Array.prototype.forEach.call(document.querySelectorAll('#tabs .tab.back'), function(b){
+    b.classList.toggle('on', (b.dataset.back|0) === S.back);
+  });
+}
+
+function switchSource(back){
+  if (!S.modes){ msg('模式表还没读到，稍等', 'err'); return; }
+  var src = S.modes.sources.filter(function(s){ return (s.back|0) === back; })[0];
+  if (!src || !src.available){ msg('这个来源在服务器上不可用', 'err'); return; }
+  var cur = (S.stat && S.stat.queue) ? (S.stat.queue.back|0) : -1;
+  S.back = back;
+  paintSrcTabs();
+  renderModes();
+  if (cur === back){ msg(''); return; }        /* 已经在这个来源：只换了浏览用的模式列表 */
+  S.modeOf = S.modeOf || {};
+  var mode = S.modeOf[back] || (src.modes[0] && src.modes[0].mode);
+  if (!mode) return;
+  S.backPending = back;
+  S.backPendingAt = Date.now();
+  msg('正在切到「' + src.name + '」…');
+  api('/v1/player/play?source=' + (back === 1 ? 'qq' : 'nav') +
+      '&mode=' + encodeURIComponent(mode) + '&index=0&limit=60', 45000)
+    .then(function(d){
+      S.backPending = null;
+      if (S.modeOf) S.modeOf[back] = mode;
+      msg('');
+      if (d && d.state) render(d);
+      refresh();
+    })
+    .catch(function(e){
+      S.backPending = null;
+      msg('切换来源失败：' + e.message, 'err');
+      paintSrcTabs();
     });
-    renderModes();
-  };
+}
+
+Array.prototype.forEach.call(document.querySelectorAll('#tabs .tab.back'), function(b){
+  b.onclick = function(){ switchSource(b.dataset.back|0); };
 });
 
 $('modes').onclick = function(ev){
   var b = ev.target.closest ? ev.target.closest('.tab') : null;
-  if (b && b.dataset.mode) playMode(b.dataset.mode);
+  if (b && b.dataset.mode){
+    /* 记住每个来源上次选的模式：切来源时用它，而不是每次都回到第一个模式 */
+    S.modeOf = S.modeOf || {};
+    S.modeOf[S.back] = b.dataset.mode;
+    playMode(b.dataset.mode);
+  }
 };
 
 /* 队列 / 搜索结果共用一套点击逻辑：
