@@ -164,6 +164,23 @@ def hotspot_state() -> dict:
     return {"name": "", "state": "off"}
 
 
+def do_4g() -> str:
+    """让服务器切到 4G 数据（板子点"使用4G网"时用）。
+    没有信号时直接回明确原因，别让用户在那干等。"""
+    out = _run(["mmcli", "-m", "any"], 25)[1]
+    if "Modem/" not in out and "modem" not in out.lower():
+        return "ERR 没检测到 4G modem（SIM 插好了吗）"
+    m = re.search(r"signal quality: (\d+)%", out)
+    sig = int(m.group(1)) if m else -1
+    if sig == 0:
+        return "ERR 4G 没信号（0%），检查天线/位置"
+    rc, o = _run(["nmcli", "connection", "up", "lte"], 90)
+    if rc != 0:
+        return "ERR 4G 连不上: %s" % o[:120]
+    ip = _run(["bash", "-c", "ip -4 -br addr show wwan0 | awk '{print $3}'"], 10)[1]
+    return "OK 4G 已连上（信号 %d%%）ip=%s" % (sig, ip)
+
+
 def do_hotspot(args: list[str]) -> str:
     ssid = args[0] if args else "ESP-Music-Server"
     password = args[1] if len(args) > 1 else "esp12345678"
@@ -212,6 +229,8 @@ def handle_command(text: str) -> str:
         hs = hotspot_state()
         return "OK ip=%s dac=? hotspot=%s rx=%d tx=%d" % (
             ip["wlan0"] or "none", hs.get("state", "?"), LINK.rx_bytes, LINK.tx_bytes)
+    if cmd == "4G":
+        return do_4g()
     if cmd == "HOTSPOT":
         return do_hotspot(args)
     if cmd == "HOTSPOT-OFF":
