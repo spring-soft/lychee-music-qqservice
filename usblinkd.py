@@ -203,16 +203,31 @@ def do_hotspot_off() -> str:
 
 
 def do_wifi(args: list[str]) -> str:
+    """让服务器连指定 WiFi —— **必须真验证通断**。
+
+    ⚠️ 实测踩过假成功：nmcli 返回 0 说"激活成功"，但实际没关联上；
+       紧接着读 ip 拿到的是残留旧地址，于是回了假的 "OK ip=..."。
+       所以这里：等 3 秒 → 查 wlan0 状态 → 查 IP → **ping 通网关**，全过才算成功。
+    """
     if len(args) < 2:
         return "ERR 用法: WIFI <ssid> <password>"
     ssid, password = args[0], args[1]
     rc, out = _run(["nmcli", "device", "wifi", "connect", ssid,
                     "password", password, "ifname", "wlan0"], 120)
     if rc != 0:
-        return "ERR 连不上 %s: %s" % (ssid, out[:120])
-    ip = wifi_ip()["wlan0"]
-    return "OK ip=%s 已连上 %s" % (ip, ssid)
+        return "ERR nmcli 连不上 %s: %s" % (ssid, out[:120])
 
+    time.sleep(3)                                  # 等 DHCP/关联稳定
+    state = _run(["nmcli", "-t", "-f", "GENERAL.STATE", "device", "show", "wlan0"], 15)[1]
+    ip = wifi_ip()["wlan0"]
+    gw = _run(["bash", "-c",
+               "ip route | awk '/default/{print $3; exit}'"], 10)[1]
+    ping = _run(["ping", "-c", "2", "-W", "2", gw or "192.168.0.1"], 12)[1]
+    ping_ok = (" 0% packet loss" in ping) or (" 0% loss" in ping)
+    if "connected" not in state.lower() or not ip or not ping_ok:
+        return ("ERR 连上了但网络不通（state=%s ip=%s ping网关=%s）"
+                % (state[:40], ip or "无", "通" if ping_ok else "不通"))
+    return "OK ip=%s 已连上 %s（网关可达）" % (ip, ssid)
 
 def handle_command(text: str) -> str:
     """执行一条板子发来的指令，返回要回给板子的那一行（不含 ESP< 前缀）。"""
