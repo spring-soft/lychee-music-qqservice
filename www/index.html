@@ -1,0 +1,498 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#FFFFFF">
+<meta name="color-scheme" content="light">
+<title>ESP-Music 服务器播放器</title>
+<style>
+/* ============================================================
+   视觉与 ESP 设备自带的网页控制台同一套（照搬它的调色板与组件）：
+   页面底 #FFFFFF / 卡片 #F7F7F5 / 描边 #E8E6E2
+   强调 #1A73E8 / 强调底 #E8F0FE / 主文字 #1C1C1E
+   次要文字 #6E6E73 / 图标灰 #969698 / 收藏星 #FACC15
+   ============================================================ */
+:root{
+  --bg:#FFFFFF; --card:#F7F7F5; --line:#E8E6E2;
+  --accent:#1A73E8; --accent-d:#1667CF; --accent-bg:#E8F0FE;
+  --text:#1C1C1E; --muted:#6E6E73; --icon:#969698; --star:#FACC15;
+  --press:#EFEDE9; --warn-bg:#FFF4E5; --warn-line:#F3D9AE; --warn-text:#8A4B00;
+  --ok:#0F7B3E; --err:#C0392B;
+}
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent;}
+[hidden]{display:none !important;}
+html,body{margin:0;padding:0;background:var(--bg);color:var(--text);
+  font:15px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Hiragino Sans GB","Microsoft YaHei","Noto Sans CJK SC",sans-serif;
+  -webkit-text-size-adjust:100%;overscroll-behavior-y:none;}
+.wrap{max-width:720px;margin:0 auto;padding:12px 12px 28px;}
+h1,p{margin:0;}
+button{font:inherit;color:inherit;background:none;border:0;padding:0;margin:0;cursor:pointer;
+  touch-action:manipulation;-webkit-user-select:none;user-select:none;}
+svg{display:block;}
+
+.top{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:4px 2px 10px;}
+.top h1{font-size:18px;letter-spacing:.2px;}
+.sub{font-size:12px;color:var(--muted);margin-top:2px;}
+.dot{width:10px;height:10px;border-radius:50%;background:var(--icon);flex:none;}
+.dot.ok{background:#34A853;}
+.dot.bad{background:#E8A33D;}
+
+.offline{background:var(--warn-bg);border:1px solid var(--warn-line);color:var(--warn-text);
+  font-size:13px;padding:8px 12px;border-radius:10px;margin-bottom:10px;text-align:center;}
+
+.card{background:var(--card);border:1px solid var(--line);border-radius:12px;
+  padding:12px;margin-bottom:12px;box-shadow:0 1px 2px rgba(0,0,0,.03);}
+
+.bigwrap{display:flex;justify-content:center;padding:0 0 10px;}
+.bigcover{width:132px;height:132px;flex:none;border-radius:12px;overflow:hidden;
+  background:var(--press);border:1px solid var(--line);
+  display:flex;align-items:center;justify-content:center;color:var(--icon);}
+.bigcover img{width:100%;height:100%;object-fit:cover;display:block;}
+.pmeta{text-align:center;padding:0 2px;}
+.ptitle{font-size:17px;font-weight:600;line-height:1.3;overflow:hidden;display:-webkit-box;
+  -webkit-line-clamp:2;-webkit-box-orient:vertical;}
+.partist{font-size:13px;color:var(--muted);white-space:nowrap;overflow:hidden;
+  text-overflow:ellipsis;margin-top:2px;}
+.palbum{font-size:12px;color:var(--icon);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+.pspec{font-size:12px;margin-top:2px;color:var(--icon);white-space:nowrap;overflow:hidden;
+  text-overflow:ellipsis;font-variant-numeric:tabular-nums;}
+.pspec.raw{color:#1B7F3B;}
+
+.prog{height:40px;display:flex;align-items:center;touch-action:none;cursor:pointer;margin-top:2px;}
+.track{position:relative;width:100%;height:6px;border-radius:3px;background:var(--line);}
+.fill{position:absolute;left:0;top:0;bottom:0;width:0;border-radius:3px;background:var(--accent);}
+.knob{position:absolute;top:50%;left:0;width:14px;height:14px;margin:-7px 0 0 -7px;
+  border-radius:50%;background:#fff;border:2px solid var(--accent);
+  box-shadow:0 1px 3px rgba(0,0,0,.18);transition:transform .1s;}
+.prog.drag .knob{transform:scale(1.2);}
+.times{display:flex;justify-content:space-between;font-size:12px;color:var(--muted);
+  font-variant-numeric:tabular-nums;margin-top:-6px;}
+
+.ctrl{display:flex;align-items:center;justify-content:center;gap:18px;margin:8px 0 4px;}
+.playbtn{width:58px;height:58px;border-radius:50%;background:var(--accent);color:#fff;
+  display:inline-flex;align-items:center;justify-content:center;flex:none;
+  transition:transform .12s ease,background-color .12s ease;}
+.playbtn:active{background:var(--accent-d);transform:scale(.94);}
+.playbtn svg{width:26px;height:26px;}
+.iconbtn{width:44px;height:44px;flex:none;border-radius:10px;color:var(--text);
+  display:inline-flex;align-items:center;justify-content:center;}
+.iconbtn:active{background:var(--press);}
+.iconbtn svg{width:22px;height:22px;}
+.iconbtn[disabled]{opacity:.35;pointer-events:none;}
+
+.volrow{display:flex;align-items:center;gap:8px;min-height:40px;}
+.volrow svg{width:20px;height:20px;color:var(--icon);flex:none;}
+.volnum{font-size:12px;color:var(--muted);min-width:28px;text-align:right;
+  font-variant-numeric:tabular-nums;}
+input[type=range]{-webkit-appearance:none;appearance:none;background:transparent;
+  flex:1;height:40px;margin:0;min-width:0;}
+input[type=range]::-webkit-slider-runnable-track{height:6px;border-radius:3px;background:var(--line);}
+input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;appearance:none;width:20px;height:20px;
+  margin-top:-7px;border-radius:50%;background:#fff;border:2px solid var(--accent);
+  box-shadow:0 1px 3px rgba(0,0,0,.18);}
+input[type=range]::-moz-range-track{height:6px;border-radius:3px;background:var(--line);}
+input[type=range]::-moz-range-thumb{width:18px;height:18px;border-radius:50%;
+  background:#fff;border:2px solid var(--accent);}
+
+/* 来源（小胶囊）/ 模式（大按钮）分层，跟 ESP 控制台一致 */
+.tabs{display:flex;flex-wrap:wrap;gap:6px;align-items:center;
+  background:#fff;border:1px solid var(--line);border-radius:12px;padding:8px;margin-bottom:10px;}
+.tabs-lbl{font-size:11px;color:var(--icon);letter-spacing:.5px;padding-left:2px;}
+.tabs-sep{flex-basis:100%;height:0;margin:1px 0;}
+.tabs-sep::after{content:'';display:block;border-top:1px dashed var(--line);}
+.tab{min-height:34px;border-radius:9px;font-size:13px;color:var(--muted);
+  display:flex;align-items:center;justify-content:center;padding:0 12px;
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+.tab:active{background:var(--press);}
+.tab.on{background:var(--accent-bg);color:var(--accent);font-weight:600;}
+.tab.back{min-height:28px;font-size:12px;padding:0 10px;border-radius:999px;
+  background:#f2f3f5;color:var(--muted);font-weight:500;}
+.tab.back.on{background:var(--accent);color:#fff;}
+
+.search{display:flex;align-items:center;gap:8px;height:44px;padding:0 10px;
+  background:#fff;border:1px solid var(--line);border-radius:10px;margin-bottom:10px;}
+.search svg{width:18px;height:18px;color:var(--icon);flex:none;}
+.search input{flex:1;height:100%;min-width:0;border:0;outline:0;background:transparent;
+  font-size:16px;color:var(--text);-webkit-appearance:none;appearance:none;}
+.search .btn{min-height:32px;padding:0 12px;border-radius:8px;background:var(--accent);
+  color:#fff;font-size:13px;display:flex;align-items:center;}
+
+.listhead{display:flex;align-items:center;justify-content:space-between;gap:8px;
+  font-size:12px;color:var(--muted);margin:2px 0 4px;}
+.list{max-height:min(50vh,460px);overflow-y:auto;-webkit-overflow-scrolling:touch;
+  background:#fff;border:1px solid var(--line);border-radius:10px;}
+.list.plain{max-height:min(38vh,340px);margin-bottom:10px;}
+.row{display:grid;grid-template-columns:1fr auto;align-items:center;gap:8px;
+  min-height:52px;padding:8px 12px;border-bottom:1px solid var(--line);
+  cursor:pointer;touch-action:manipulation;-webkit-user-select:none;user-select:none;}
+.row:last-child{border-bottom:0;}
+.row:active{background:var(--press);}
+.row.on{background:var(--accent-bg);}
+.row.on .rtitle{color:var(--accent);font-weight:600;}
+.rmain{min-width:0;display:flex;flex-direction:column;gap:1px;}
+.rtitle{font-size:15px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+.rsub{font-size:12px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+.rdur{font-size:12px;color:var(--muted);font-variant-numeric:tabular-nums;}
+.empty{padding:22px 12px;text-align:center;color:var(--icon);font-size:13px;}
+.msg{font-size:13px;color:var(--muted);margin-top:8px;min-height:18px;word-break:break-all;}
+.msg.err{color:var(--err);}
+.msg.ok{color:var(--ok);}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <div class="top">
+    <div>
+      <h1>服务器播放器</h1>
+      <div class="sub" id="sub">连接中…</div>
+    </div>
+    <span class="dot" id="dot"></span>
+  </div>
+
+  <div class="offline" id="offline" hidden>和设备失联，正在重试…</div>
+
+  <!-- 正在播放 -->
+  <div class="card">
+    <div class="bigwrap">
+      <div class="bigcover" id="cover"></div>
+    </div>
+    <div class="pmeta">
+      <div class="ptitle" id="title">未在播放</div>
+      <div class="partist" id="artist"></div>
+      <div class="palbum" id="album"></div>
+      <div class="pspec" id="spec"></div>
+    </div>
+    <div class="prog" id="prog">
+      <div class="track"><div class="fill" id="fill"></div><div class="knob" id="knob"></div></div>
+    </div>
+    <div class="times"><span id="tcur">0:00</span><span id="tdur">0:00</span></div>
+    <div class="ctrl">
+      <button class="iconbtn" id="prev" title="上一首">
+        <svg viewBox="0 0 24 24" fill="currentColor"><path d="M6 5h2v14H6zm3 7l9-7v14z"/></svg>
+      </button>
+      <button class="playbtn" id="play" title="播放/暂停">
+        <svg id="playicon" viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"/></svg>
+      </button>
+      <button class="iconbtn" id="next" title="下一首">
+        <svg viewBox="0 0 24 24" fill="currentColor"><path d="M16 5h2v14h-2zM6 5l9 7-9 7z"/></svg>
+      </button>
+      <button class="iconbtn" id="stop" title="停止">
+        <svg viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="6" width="12" height="12" rx="2"/></svg>
+      </button>
+    </div>
+    <div class="volrow">
+      <svg viewBox="0 0 24 24" fill="currentColor"><path d="M3 10v4h3l4 4V6L6 10H3zm12.5 2a4.5 4.5 0 0 0-2.5-4v8a4.5 4.5 0 0 0 2.5-4z"/></svg>
+      <input type="range" id="vol" min="0" max="100" step="1" value="80">
+      <span class="volnum" id="volnum">80</span>
+    </div>
+  </div>
+
+  <!-- 来源 + 模式 -->
+  <div class="tabs" id="tabs">
+    <span class="tabs-lbl">来源</span>
+    <button class="tab back on" data-back="1">QQ音乐</button>
+    <button class="tab back" data-back="0">Navidrome</button>
+    <div class="tabs-sep"></div>
+    <span class="tabs-lbl">模式</span>
+    <span id="modes"></span>
+  </div>
+
+  <!-- 搜索 -->
+  <div class="search">
+    <svg viewBox="0 0 24 24" fill="currentColor"><path d="M15.5 14h-.8l-.3-.3A6.5 6.5 0 1 0 13 15.5l.3.3v.8l5 5 1.5-1.5-5-5zM9.5 14A4.5 4.5 0 1 1 14 9.5 4.5 4.5 0 0 1 9.5 14z"/></svg>
+    <input id="q" placeholder="搜索（当前来源）" autocomplete="off" autocorrect="off" spellcheck="false">
+    <button class="btn" id="go">搜索</button>
+  </div>
+  <div class="listhead" id="searchhead" hidden><span id="searchtitle">搜索结果</span>
+    <span id="searchclose" style="cursor:pointer">关闭</span></div>
+  <div class="list plain" id="searchlist" hidden></div>
+
+  <!-- 队列 -->
+  <div class="listhead"><span id="qhead">队列</span></div>
+  <div class="list" id="queue"><div class="empty">还没有队列 —— 先在上面选个模式或搜索</div></div>
+  <div class="msg" id="msg"></div>
+</div>
+
+<script>
+/* ============================================================
+   服务器播放器控制台（与 ESP 设备网页控制台同一套视觉/交互）
+   ⚠️ 本服务没有鉴权，同网段能打开这个页面的人都能控制播放 —— 既有约定。
+   ============================================================ */
+var S = { back: 1, gen: -1, modes: null, stat: null, dragging: false, volTimer: null };
+
+function $(id){ return document.getElementById(id); }
+function esc(s){ return String(s == null ? '' : s).replace(/[&<>"]/g, function(c){
+  return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]; }); }
+function mmss(ms){
+  ms = Math.max(0, ms|0);
+  var s = Math.floor(ms/1000), m = Math.floor(s/60);
+  return m + ':' + ('0' + (s%60)).slice(-2);
+}
+function msg(t, cls){ var e = $('msg'); e.textContent = t || ''; e.className = 'msg' + (cls ? ' ' + cls : ''); }
+
+function api(path, tmo){
+  var ctl = new AbortController();
+  var t = setTimeout(function(){ ctl.abort(); }, tmo || 12000);
+  return fetch(path, { signal: ctl.signal, cache: 'no-store' })
+    .then(function(r){
+      return r.text().then(function(txt){
+        var d = null;
+        try { d = JSON.parse(txt); } catch(e){}
+        if (!r.ok) throw new Error((d && (d.error || d.detail)) || ('HTTP ' + r.status));
+        return d;
+      });
+    })
+    .finally(function(){ clearTimeout(t); });
+}
+
+/* ---------------- 渲染 ---------------- */
+function renderQueue(st){
+  var q = st.queue || {};
+  if (q.gen === S.gen && q.index === S.qidx) return;      /* 没变就不重画 */
+  S.gen = q.gen; S.qidx = q.index;
+  api('/v1/player/queue').then(function(d){
+    var el = $('queue');
+    if (!d.items || !d.items.length){
+      el.innerHTML = '<div class="empty">还没有队列 —— 先在上面选个模式或搜索</div>';
+      $('qhead').textContent = '队列';
+      return;
+    }
+    $('qhead').textContent = '队列 · ' + (d.mode || '') + ' · ' + d.count + ' 首';
+    el.innerHTML = d.items.map(function(it, i){
+      return '<div class="row' + (i === d.index ? ' on' : '') + '" data-i="' + i +
+        '" data-id="' + esc(it.id) + '" data-back="' + (it.back|0) + '">' +
+        '<div class="rmain"><div class="rtitle">' + esc(it.title || '') + '</div>' +
+        '<div class="rsub">' + esc(it.artist || '') + (it.temp ? '' : '') + '</div></div>' +
+        '<div class="rdur">' + mmss(it.dur_ms) + '</div></div>';
+    }).join('');
+  }).catch(function(){});
+}
+
+function render(st){
+  S.stat = st;
+  var playing = st.state === 'playing', paused = st.state === 'paused';
+  var song = st.song || {};
+  var has = !!song.id;
+  $('dot').className = 'dot ' + (st.mpv_ok ? 'ok' : 'bad');
+  $('sub').textContent = (st.mpv_ok ? (playing ? '正在播放' : paused ? '已暂停' : '待机')
+      : '播放器不可用') + ' · ' + (st.device_id || '').replace('alsa/', '');
+  $('offline').hidden = true;
+
+  $('title').textContent = has ? (song.title || '') : '未在播放';
+  $('artist').textContent = has ? (song.artist || '') : '';
+  $('album').textContent = has ? (song.album || '') : '';
+  var au = st.audio || {};
+  if (has && au.samplerate){
+    var bits = au.format === 's32' ? '24bit' : au.format === 's16' ? '16bit' : (au.format || '');
+    $('spec').textContent = bits + ' / ' + (au.samplerate/1000) + 'kHz · ' +
+      (au.channels === 2 ? '立体声' : (au.channels || '?') + ' ch') +
+      ' · 硬件直出' + (song.suffix ? ' · ' + song.suffix.toUpperCase() : '');
+    $('spec').className = 'pspec' + (au.format === 's32' ? ' raw' : '');
+  } else {
+    $('spec').textContent = '';
+    $('spec').className = 'pspec';
+  }
+
+  var dur = st.dur_ms || (song.dur_ms || 0), pos = st.pos_ms || 0;
+  if (!S.dragging){
+    var pct = dur > 0 ? Math.min(100, pos/dur*100) : 0;
+    $('fill').style.width = pct + '%';
+    $('knob').style.left = pct + '%';
+    $('tcur').textContent = mmss(pos);
+  }
+  $('tdur').textContent = mmss(dur);
+
+  $('playicon').innerHTML = playing
+    ? '<path d="M7 5h4v14H7zm6 0h4v14h-4z"/>'
+    : '<path d="M8 5v14l11-7z"/>';
+  $('prev').disabled = $('next').disabled = !has;
+
+  if (st.volume != null && document.activeElement !== $('vol')){
+    $('vol').value = st.volume;
+    $('volnum').textContent = st.volume;
+  }
+
+  /* 模式高亮：跟服务器当前队列对齐 */
+  if (st.queue && st.queue.mode_key){
+    Array.prototype.forEach.call(document.querySelectorAll('#modes .tab'), function(b){
+      b.classList.toggle('on', b.dataset.mode === st.queue.mode_key);
+    });
+  }
+  var srcBack = (st.queue && st.queue.back >= 0 && st.source) ? st.queue.back : S.back;
+  Array.prototype.forEach.call(document.querySelectorAll('#tabs .tab.back'), function(b){
+    b.classList.toggle('on', (b.dataset.back|0) === srcBack);
+  });
+
+  var cov = $('cover'), sid = has ? (song.cover || '') : '';
+  if (sid && S.coverId !== song.back + ':' + sid){
+    S.coverId = song.back + ':' + sid;
+    cov.innerHTML = '<img alt="" src="/v1/player/cover?back=' + (song.back|0) + '&size=300&id=' +
+      encodeURIComponent(sid) + '" onerror="this.parentNode.innerHTML=\'\'">';
+  } else if (!sid && S.coverId){
+    S.coverId = ''; cov.innerHTML = '';
+  }
+
+  renderQueue(st);
+}
+
+function refresh(){
+  return api('/v1/player/status', 8000).then(render).catch(function(e){
+    $('offline').hidden = false;
+    $('dot').className = 'dot bad';
+    $('sub').textContent = '连不上服务器：' + e.message;
+  });
+}
+
+/* ---------------- 命令 ---------------- */
+function cmd(path){
+  return api(path, 15000).then(function(d){
+    msg('');
+    if (d && d.state) render(d);
+    return d;
+  }).catch(function(e){ msg('操作失败：' + e.message, 'err'); });
+}
+
+function playMode(mode){
+  var src = S.back === 1 ? 'qq' : 'nav';
+  msg('正在准备队列…');
+  api('/v1/player/play?source=' + src + '&mode=' + encodeURIComponent(mode) +
+      '&index=0&limit=60&skip=' + (S.back === 1 && mode === 'fav' ? 0 : 0), 30000)
+    .then(function(d){ msg(''); render(d); refresh(); })
+    .catch(function(e){ msg('取列表失败：' + e.message, 'err'); });
+}
+
+function playItem(it){
+  var src = (it.back|0) === 1 ? 'qq' : 'nav';
+  msg('正在播这首…');
+  api('/v1/player/play?source=' + src + '&id=' + encodeURIComponent(it.id), 30000)
+    .then(function(d){ msg(''); hideSearch(); render(d); refresh(); })
+    .catch(function(e){ msg('播放失败：' + e.message, 'err'); });
+}
+
+/* ---------------- 事件 ---------------- */
+$('play').onclick = function(){
+  if (!S.stat || !S.stat.song || !S.stat.song.id) return;
+  cmd('/v1/player/toggle');
+};
+$('prev').onclick = function(){ cmd('/v1/player/prev'); };
+$('next').onclick = function(){ cmd('/v1/player/next'); };
+$('stop').onclick = function(){ cmd('/v1/player/stop'); };
+
+/* 进度条：按下/拖动就地更新，松手才真的发 seek */
+(function(){
+  var prog = $('prog');
+  function pctFromEvent(ev){
+    var r = prog.getBoundingClientRect();
+    var x = (ev.touches ? ev.touches[0].clientX : ev.clientX) - r.left;
+    return Math.max(0, Math.min(1, x / r.width));
+  }
+  function start(ev){
+    if (!S.stat || !S.stat.song || !S.stat.song.id) return;
+    S.dragging = true; prog.classList.add('drag'); move(ev); ev.preventDefault();
+  }
+  function move(ev){
+    if (!S.dragging) return;
+    var p = pctFromEvent(ev), dur = S.stat.dur_ms || 0;
+    $('fill').style.width = (p*100) + '%';
+    $('knob').style.left = (p*100) + '%';
+    $('tcur').textContent = mmss(p*dur);
+    S.seekTo = Math.round(p*dur);
+  }
+  function end(){
+    if (!S.dragging) return;
+    S.dragging = false; prog.classList.remove('drag');
+    if (S.seekTo != null) cmd('/v1/player/seek?pos_ms=' + S.seekTo);
+  }
+  prog.addEventListener('mousedown', start);
+  window.addEventListener('mousemove', move);
+  window.addEventListener('mouseup', end);
+  prog.addEventListener('touchstart', start, {passive:false});
+  prog.addEventListener('touchmove', move, {passive:false});
+  prog.addEventListener('touchend', end);
+})();
+
+/* 音量：拖动时只更新数字，停手 300ms 才发命令（别把 mpv 打爆） */
+$('vol').addEventListener('input', function(){
+  var v = +$('vol').value;
+  $('volnum').textContent = v;
+  clearTimeout(S.volTimer);
+  S.volTimer = setTimeout(function(){ cmd('/v1/player/volume?level=' + v); }, 300);
+});
+
+/* 来源切换 */
+Array.prototype.forEach.call(document.querySelectorAll('#tabs .tab.back'), function(b){
+  b.onclick = function(){
+    S.back = b.dataset.back|0;
+    Array.prototype.forEach.call(document.querySelectorAll('#tabs .tab.back'), function(x){
+      x.classList.toggle('on', x === b);
+    });
+    renderModes();
+  };
+});
+
+$('modes').onclick = function(ev){
+  var b = ev.target.closest ? ev.target.closest('.tab') : null;
+  if (b && b.dataset.mode) playMode(b.dataset.mode);
+};
+
+/* 队列点击 */
+$('queue').onclick = function(ev){
+  var row = ev.target.closest ? ev.target.closest('.row') : null;
+  if (!row) return;
+  playItem({ id: row.dataset.id, back: +row.dataset.back });
+};
+
+/* 搜索 */
+function hideSearch(){ $('searchlist').hidden = true; $('searchhead').hidden = true; }
+function doSearch(){
+  var q = $('q').value.trim();
+  if (!q) return;
+  var src = S.back === 1 ? 'qq' : 'nav';
+  msg('搜索中…');
+  api('/v1/player/search?source=' + src + '&q=' + encodeURIComponent(q) + '&limit=30', 25000)
+    .then(function(d){
+      msg('');
+      var el = $('searchlist');
+      $('searchtitle').textContent = '搜索结果 · ' + d.count + ' 首';
+      $('searchhead').hidden = false;
+      el.hidden = false;
+      el.innerHTML = d.items.length ? d.items.map(function(it){
+        return '<div class="row" data-id="' + esc(it.id) + '" data-back="' + (it.back|0) + '">' +
+          '<div class="rmain"><div class="rtitle">' + esc(it.title) + '</div>' +
+          '<div class="rsub">' + esc(it.artist) + (it.album ? ' · ' + esc(it.album) : '') + '</div></div>' +
+          '<div class="rdur">' + mmss(it.dur_ms) + '</div></div>';
+      }).join('') : '<div class="empty">没搜到</div>';
+    })
+    .catch(function(e){ msg('搜索失败：' + e.message, 'err'); });
+}
+$('go').onclick = doSearch;
+$('q').addEventListener('keydown', function(e){ if (e.key === 'Enter') doSearch(); });
+$('searchclose').onclick = hideSearch;
+$('searchlist').onclick = function(ev){
+  var row = ev.target.closest ? ev.target.closest('.row') : null;
+  if (row) playItem({ id: row.dataset.id, back: +row.dataset.back });
+};
+
+/* 模式列表（服务器给什么就显示什么，两边不写死） */
+function renderModes(){
+  if (!S.modes) return;
+  var src = S.modes.sources.filter(function(s){ return (s.back|0) === S.back; })[0];
+  var el = $('modes');
+  if (!src || !src.available){
+    el.innerHTML = '<span class="rsub">这个来源在服务器上不可用</span>';
+    return;
+  }
+  el.innerHTML = src.modes.map(function(m){
+    return '<button class="tab" data-mode="' + esc(m.mode) + '">' + esc(m.name) + '</button>';
+  }).join(' ');
+}
+
+/* 启动 */
+api('/v1/player/modes', 10000).then(function(d){ S.modes = d; renderModes(); refresh(); })
+  .catch(function(e){ msg('读模式失败：' + e.message, 'err'); refresh(); });
+setInterval(refresh, 1200);
+</script>
+</body>
+</html>

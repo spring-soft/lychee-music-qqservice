@@ -1,0 +1,56 @@
+[Unit]
+Description=QQ Music contract-layer service (ESP-Music 音乐终端的第二音源)
+Documentation=https://github.com/spring-soft/lychee-music-qqservice
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/qqmusic
+
+# 非 root 运行。这个服务监听 0.0.0.0:3210、**没有任何鉴权**，
+# 而它是跑在一台真实设备上（不像容器里有 namespace 隔离），
+# 所以能不给 root 就不给：它只需要读写自己的 /opt/qqmusic/data。
+User=qqmusic
+Group=qqmusic
+
+# ============================================================
+#  ⚠️⚠️ 这里【绝对不能】加 HTTP_PROXY / HTTPS_PROXY / http_proxy / https_proxy
+# ============================================================
+#  QQ 音乐只认【中国大陆 IP】。代理出口在国外（实测 AWS 首尔 43.201.70.165），
+#  运行时代理一开，所有 QQ 接口会**直接全部失败**。
+#  代理只在安装阶段用（pip：见 README 的部署说明），不参与运行。
+#  ——这条在 Dockerfile 里就写明过，这里沿用同样的约束。
+
+Environment=QQ_DATA_DIR=/opt/qqmusic/data
+Environment=LOG_LEVEL=info
+Environment=PYTHONUNBUFFERED=1
+
+# 单 worker：上游客户端自己维护连接与会话，多 worker 会重复登录态、更容易触发风控
+ExecStart=/opt/qqmusic/venv/bin/uvicorn app:app --host 0.0.0.0 --port 3210 --log-level info --no-access-log
+
+Restart=always
+RestartSec=5
+
+# ============================================================
+#  内存上限 —— 这台机器特别需要
+# ============================================================
+#  设备总共只有 376MB 内存，而且同时还在跑热点（dnsmasq / dnsproxy）。
+#  实测过一次教训：部署过程中内存被榨干时，**sshd 连 fork 都做不到**，
+#  SSH 握手直接被 reset —— 只能干等它缓过来。
+#  设了上限之后，万一这个服务内存失控，systemd 只杀它自己然后重启，
+#  不会把 sshd（也就是救命的入口）一起拖死。
+#
+#  数字怎么定的（2026-10-12 实测）：
+#    服务真实峰值 memory.peak = 68.2MB，且 memory.events 全 0（从没接近过上限）、
+#    memory.swap.current = 0（一次都没被换出）、系统 PSI some avg10 = 0.00（内存无压力）。
+#    所以 150M 已经是峰值的 2.2 倍，够用；而最坏情况下还能给系统留约 116MB，
+#    sshd 活得下来。（一开始设的 200M 偏大了：那等于允许它占到系统一半以上。）
+#
+#  ⚠️ MemoryHigh 必须 ≤ MemoryMax（内核要求 memory.high <= memory.max），
+#     改一个就得同时看另一个。
+MemoryMax=150M
+MemoryHigh=120M
+
+[Install]
+WantedBy=multi-user.target

@@ -44,7 +44,7 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Query
-from fastapi.responses import JSONResponse, PlainTextResponse
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 
 from qqmusic_api import Client, Credential
 from qqmusic_api.core.exceptions import (
@@ -56,12 +56,19 @@ from qqmusic_api.modules.login import QRLoginType
 from qqmusic_api.modules.search import SearchType
 from qqmusic_api.modules.song import SongFileInfo, SongFileType, SongQueryInfo
 
+# ★ 服务器端播放器（让这台机器接的 USB DAC 自己出声）。
+#   它不 import 本模块（否则循环导入），QQ 那侧的取数逻辑由本文件以**回调**注入，
+#   见文件末尾的 _qq_item / _qq_url / _qq_list。
+import player
+
 logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO").upper(),
                     format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("qqmusic")
 
 DATA_DIR = Path(os.environ.get("QQ_DATA_DIR", "/data"))
 CRED_PATH = DATA_DIR / "credential.json"
+# 网页控制台的静态页（部署在 /opt/qqmusic/www/index.html）
+WWW_DIR = Path(os.environ.get("QQ_WWW_DIR", "/opt/qqmusic/www"))
 
 # 封面 URL 模板（**给固件参考**：本服务不代理封面，固件自己拼这个 URL 直连）。
 #   格式：http://y.qq.com/music/photo_new/T002R{size}x{size}M000{albumMid}.jpg
@@ -282,13 +289,39 @@ async def lifespan(app: FastAPI):
     _state["client"] = Client(credential=cred)
     set_cred(cred)
     log.info("凭据: %s", cred_state())
+    # 服务器端播放器：mpv 子进程跟着本服务一起死活（不额外多一个 daemon）
+    await player.startup(_qq_item, _qq_url, _qq_list, _qq_search, MODES)
     try:
         yield
     finally:
+        await player.shutdown()
         await _state["client"].close()
 
 
 app = FastAPI(title="ESP-Music QQ 契约层", version="1.0", lifespan=lifespan)
+
+# /v1/player/*（服务器端播放器：status/play/pause/seek/volume/queue/modes/devices）
+app.include_router(player.router)
+
+
+# ---------------- 网页控制台 ----------------
+#
+# 为什么要它：服务器这台机器接了 USB DAC、能自己出声之后，用户不可能每次都去"设备"上操作；
+# 手机/电脑打开 http://<服务器>:3210/ 就能控制播放（跟 ESP 那个网页控制台是同一套视觉）。
+# ⚠️ 本服务**没有任何鉴权**（内网自用）—— 这意味着同网段任何人都能控制播放。
+#    这是既有约定（ESP 的控制台也一样），别在这里偷偷加"半套"鉴权把自己绕进去。
+
+@app.get("/", response_class=HTMLResponse)
+async def console_index() -> Any:
+    f = WWW_DIR / "index.html"
+    if not f.exists():
+        raise HTTPException(404, f"控制台页面不存在：{f}")
+    return HTMLResponse(f.read_text("utf-8"))
+
+
+@app.get("/favicon.ico")
+async def favicon() -> Any:
+    return JSONResponse({"ok": True})
 
 
 # ---------------- /v1/health ----------------
@@ -549,20 +582,25 @@ async def _songs_to_items(songs: Any, quality: str | None) -> list[dict[str, Any
     return [it for it in (song_to_item(s, quality) for s in (songs or [])) if it]
 
 
+# 模式清单。**`/v1/modes` 和服务器端播放器共用这一份** ——
+# 播放器要用同样的 mode 键去建队列，两边写两份迟早对不上。
+MODES: list[dict[str, Any]] = [
+    {"mode": "fav",     "name": "收藏",     "desc": "QQ 账号的「我喜欢」",        "kind": "user"},
+    {"mode": "daily",   "name": "每日30首", "desc": "每天 30 首为你推荐",         "kind": "card"},
+    {"mode": "million", "name": "百万收藏", "desc": "百万收藏歌单",               "kind": "card"},
+    {"mode": "newrec",  "name": "新歌推荐", "desc": "首页卡片里的新歌推荐",        "kind": "card"},
+    {"mode": "guess",   "name": "刷歌",     "desc": "猜你喜欢·沉浸刷歌，每次都不一样", "kind": "radio"},
+    {"mode": "radar",   "name": "雷达",     "desc": "红心雷达：按你的收藏推荐（每条带推荐理由）", "kind": "radar"},
+]
+
+
 @app.get("/v1/modes")
 async def modes() -> dict[str, Any]:
     """列出可用的模式（给固件/前端看的说明书）。
 
     固件的「模式」菜单就用这份清单 —— 加/删模式只改服务端，固件不用重编。
     """
-    return {"modes": [
-        {"mode": "fav",     "name": "收藏",     "desc": "QQ 账号的「我喜欢」",        "kind": "user"},
-        {"mode": "daily",   "name": "每日30首", "desc": "每天 30 首为你推荐",         "kind": "card"},
-        {"mode": "million", "name": "百万收藏", "desc": "百万收藏歌单",               "kind": "card"},
-        {"mode": "newrec",  "name": "新歌推荐", "desc": "首页卡片里的新歌推荐",        "kind": "card"},
-        {"mode": "guess",   "name": "刷歌",     "desc": "猜你喜欢·沉浸刷歌，每次都不一样", "kind": "radio"},
-        {"mode": "radar",   "name": "雷达",     "desc": "红心雷达：按你的收藏推荐（每条带推荐理由）", "kind": "radar"},
-    ]}
+    return {"modes": MODES}
 
 
 @app.get("/v1/list")
@@ -855,10 +893,46 @@ async def favorite(id: str = Query(...), on: int = Query(1)) -> dict[str, Any]:
         "ok": bool(ok),
         "on": True,
         "id": id, "song_id": raw_id, "name": getattr(song, "name", ""),
-        "fav_count_before": before, "fav_count_after": after,
+        "fav_count_before": before,
+        "fav_count_after": after,
         "added": added,
         "note": ("已加入" if added else
                  "上游返回成功，但收藏总数没变 —— 多半是这首歌本来就在你「我喜欢」里"),
     }
+
+
+# ============================================================ 服务器端播放器的取数回调
+#
+# 为什么是回调注入（player.startup 的参数），而不是让 player.py 直接 import 本模块：
+#   1) 会循环导入（本模块已经 import 了 player）；
+#   2) 音质选择、卡片模式、限流重试这些逻辑本来就在这个文件里，
+#      播放器只要"拿到统一形状的队列项"和"一个现成的播放地址"就够了。
+
+async def _qq_item(mid: str) -> dict[str, Any]:
+    """mid -> /v1/list 同形状的项（单曲播放用）。"""
+    song = await fetch_song(mid)
+    it = song_to_item(song)
+    if it is None:
+        raise HTTPException(404, f"这首歌没有可用音质（可能全都需要付费）: {mid}")
+    return it
+
+
+async def _qq_url(mid: str) -> str:
+    """mid -> 直链。**播放前现取**（vkey 只有 2 小时，绝不能提前存进队列）。"""
+    r = await resolve_play_url(mid, None)
+    return r["url"]
+
+
+async def _qq_list(mode: str, limit: int) -> tuple[str, list[dict[str, Any]]]:
+    """mode -> (中文名, 队列项)。直接复用 /v1/list 的取数逻辑，形状天然一致。"""
+    r = await list_by_mode(mode=mode, limit=limit)
+    return r["label"], r["items"]
+
+
+async def _qq_search(q: str, limit: int) -> list[dict[str, Any]]:
+    """搜歌 -> 队列项（服务器端播放器的搜索用，形状跟 /v1/search 一致）。"""
+    r = await search(q=q, limit=limit)
+    return r["items"]
+
 
 
