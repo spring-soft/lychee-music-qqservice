@@ -1,0 +1,28 @@
+#!/bin/sh
+# 把下载好的文件"装"进 Navidrome 曲库（由 qqmusic 通过 sudo 调用，sudoers 里只放行这一个脚本）。
+#
+# 为什么要它：曲库在 exfat 上，挂载参数是 uid=0,gid=0,umask=022 ——
+# 所有文件都被强制成 root:root 755，改不了属主，服务用户 qqmusic 写不进去。
+# 与其改挂载参数（会影响正在跑的 Navidrome 曲库），不如留一个**只做一件事**的
+# 特权入口：只接受来自固定暂存目录的文件、只写进固定曲库目录。
+set -e
+
+SRC="$1"
+NAME="$2"
+STAGE=/opt/qqmusic/data/dl_stage
+DST="/mnt/usb/music/QQ下载"
+
+case "$SRC" in
+    "$STAGE"/*) ;;
+    *) echo "拒绝：源文件不在 $STAGE 里" >&2; exit 2 ;;
+esac
+case "$NAME" in
+    ""|*/*|*..*|.*) echo "拒绝：文件名非法（$NAME）" >&2; exit 3 ;;
+esac
+[ -f "$SRC" ] || { echo "拒绝：源文件不存在" >&2; exit 4; }
+
+mkdir -p "$DST"
+cp -f "$SRC" "$DST/$NAME"
+chmod 644 "$DST/$NAME"
+rm -f "$SRC"
+echo "installed: $DST/$NAME"

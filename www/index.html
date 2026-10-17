@@ -123,7 +123,7 @@ input[type=range]::-moz-range-thumb{width:18px;height:18px;border-radius:50%;
 .list{max-height:min(50vh,460px);overflow-y:auto;-webkit-overflow-scrolling:touch;
   background:#fff;border:1px solid var(--line);border-radius:10px;}
 .list.plain{max-height:min(38vh,340px);margin-bottom:10px;}
-.row{display:grid;grid-template-columns:1fr auto;align-items:center;gap:8px;
+.row{display:grid;grid-template-columns:1fr auto auto;align-items:center;gap:8px;
   min-height:52px;padding:8px 12px;border-bottom:1px solid var(--line);
   cursor:pointer;touch-action:manipulation;-webkit-user-select:none;user-select:none;}
 .row:last-child{border-bottom:0;}
@@ -135,6 +135,22 @@ input[type=range]::-moz-range-thumb{width:18px;height:18px;border-radius:50%;
 .rsub{font-size:12px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
 .rdur{font-size:12px;color:var(--muted);font-variant-numeric:tabular-nums;}
 .empty{padding:22px 12px;text-align:center;color:var(--icon);font-size:13px;}
+
+/* ---------- 下载 ---------- */
+.rdl{width:34px;height:34px;border-radius:8px;display:flex;align-items:center;
+  justify-content:center;color:var(--icon);font-size:17px;flex:none;}
+.rdl:active{background:var(--press);}
+.rdl.done{color:var(--ok);}
+.rdl.on{background:var(--accent-bg);color:var(--accent);}
+.row .ck{width:20px;height:20px;flex:none;accent-color:var(--accent);}
+.batchbtn{font-size:12px;color:var(--accent);padding:2px 9px;border-radius:8px;
+  background:var(--accent-bg);font-weight:600;}
+#dlbar{position:fixed;left:12px;right:12px;bottom:12px;max-width:696px;margin:0 auto;
+  background:var(--accent);color:#fff;border-radius:12px;padding:12px 14px;
+  display:flex;align-items:center;justify-content:space-between;gap:10px;
+  box-shadow:0 4px 14px rgba(0,0,0,.2);z-index:40;font-size:14px;}
+#dlbar button{color:#fff;font-weight:600;font-size:14px;}
+.dlstat{font-size:12px;color:var(--muted);margin-top:6px;min-height:16px;}
 .msg{font-size:13px;color:var(--muted);margin-top:8px;min-height:18px;word-break:break-all;}
 .msg.err{color:var(--err);}
 .msg.ok{color:var(--ok);}
@@ -236,9 +252,22 @@ input[type=range]::-moz-range-thumb{width:18px;height:18px;border-radius:50%;
   <div class="list plain" id="searchlist" hidden></div>
 
   <!-- 队列 -->
-  <div class="listhead"><span id="qhead">队列</span></div>
+  <div class="listhead"><span id="qhead">队列</span>
+    <span style="display:flex;gap:8px;align-items:center">
+      <span class="dlstat" id="dlstat" style="margin:0"></span>
+      <button class="batchbtn" id="qbatch">批量下载</button>
+    </span>
+  </div>
   <div class="list" id="queue"><div class="empty">还没有队列 —— 先在上面选个模式或搜索</div></div>
   <div class="msg" id="msg"></div>
+</div>
+
+<div id="dlbar" hidden>
+  <span id="dlbar-txt">已选 0 首</span>
+  <span style="display:flex;gap:14px">
+    <button id="dlbar-cancel">取消</button>
+    <button id="dlbar-go">下载</button>
+  </span>
 </div>
 
 <script>
@@ -291,7 +320,7 @@ function renderQueue(st){
         '" data-id="' + esc(it.id) + '" data-back="' + (it.back|0) + '">' +
         '<div class="rmain"><div class="rtitle">' + esc(it.title || '') + '</div>' +
         '<div class="rsub">' + esc(it.artist || '') + (it.temp ? '' : '') + '</div></div>' +
-        '<div class="rdur">' + mmss(it.dur_ms) + '</div></div>';
+        '<div class="rdur">' + mmss(it.dur_ms) + '</div>' + dlCell(it) + '</div>';
     }).join('');
   }).catch(function(){});
 }
@@ -462,12 +491,28 @@ $('modes').onclick = function(ev){
   if (b && b.dataset.mode) playMode(b.dataset.mode);
 };
 
-/* 队列点击 */
-$('queue').onclick = function(ev){
-  var row = ev.target.closest ? ev.target.closest('.row') : null;
-  if (!row) return;
-  playItem({ id: row.dataset.id, back: +row.dataset.back });
-};
+/* 队列 / 搜索结果共用一套点击逻辑：
+ *   点 ⬇  = 下载这首（QQ）
+ *   点勾选框 = 批量选择
+ *   点行    = 播放（批量模式下不播，避免误触） */
+function listClick(ev){
+  var t = ev.target;
+  var dl = t.closest ? t.closest('button.rdl') : null;
+  if (dl){ dlAdd(dl.dataset.id); return; }
+  var ck = t.closest ? t.closest('input.ck') : null;
+  if (ck){
+    setTimeout(function(){                    /* 等浏览器把 checked 翻过来 */
+      if (ck.checked) S.dlSel[ck.dataset.id] = true;
+      else delete S.dlSel[ck.dataset.id];
+      dlBarUpdate();
+    }, 0);
+    return;
+  }
+  var row = t.closest ? t.closest('.row') : null;
+  if (row && !S.dlBatch) playItem({ id: row.dataset.id, back: +row.dataset.back });
+}
+$('queue').onclick = listClick;
+$('searchlist').onclick = listClick;
 
 /* 搜索 */
 function hideSearch(){ $('searchlist').hidden = true; $('searchhead').hidden = true; }
@@ -487,7 +532,7 @@ function doSearch(){
         return '<div class="row" data-id="' + esc(it.id) + '" data-back="' + (it.back|0) + '">' +
           '<div class="rmain"><div class="rtitle">' + esc(it.title) + '</div>' +
           '<div class="rsub">' + esc(it.artist) + (it.album ? ' · ' + esc(it.album) : '') + '</div></div>' +
-          '<div class="rdur">' + mmss(it.dur_ms) + '</div></div>';
+          '<div class="rdur">' + mmss(it.dur_ms) + '</div>' + dlCell(it) + '</div>';
       }).join('') : '<div class="empty">没搜到</div>';
     })
     .catch(function(e){ msg('搜索失败：' + e.message, 'err'); });
@@ -495,10 +540,6 @@ function doSearch(){
 $('go').onclick = doSearch;
 $('q').addEventListener('keydown', function(e){ if (e.key === 'Enter') doSearch(); });
 $('searchclose').onclick = hideSearch;
-$('searchlist').onclick = function(ev){
-  var row = ev.target.closest ? ev.target.closest('.row') : null;
-  if (row) playItem({ id: row.dataset.id, back: +row.dataset.back });
-};
 
 /* 模式列表（服务器给什么就显示什么，两边不写死） */
 function renderModes(){
@@ -609,7 +650,107 @@ $('acc-login').onclick = function(){
 };
 $('acc-cancel').onclick = accClose;
 
-/* 启动 */
+/* ---------------- 下载（QQ 无损 -> Navidrome 曲库） ----------------
+ *
+ * 服务端已经把活儿全做完了（下载/补封面/写 UTF-8 歌词/装进曲库），
+ * 网页只负责"点一下 -> GET /v1/download/add?id=…"，然后看 /v1/download/list 的进度。
+ * ⚠️ Navidrome 的歌本来就在曲库里，不给下载按钮。
+ */
+S.dlBatch = false;
+S.dlSel = {};        /* id -> true（批量选择） */
+S.done = {};         /* id -> true（已知下载完成的，给行上打勾） */
+
+function dlCell(it){
+  var id = it && it.id || '';
+  if (!id) return '<div></div>';
+  if (S.dlBatch){
+    var on = S.dlSel[id] ? ' checked' : '';
+    return '<div class="rdl"><input type="checkbox" class="ck" data-id="' + esc(id) + '"' + on + '></div>';
+  }
+  if ((it.back | 0) !== 1) return '<div></div>';        /* Navidrome 的不用下 */
+  var done = S.done[id] ? ' done' : '';
+  return '<button class="rdl' + done + '" data-id="' + esc(id) + '" title="下载到 Navidrome 曲库">⬇</button>';
+}
+
+function dlAdd(id){
+  if (!id) return Promise.resolve();
+  msg('已提交下载，正在排队…');
+  return api('/v1/download/add?id=' + encodeURIComponent(id), 20000).then(function(d){
+    var j = (d && d.job) || {};
+    msg('下载已开始：' + (j.title || id) + (j.note ? '（' + j.note + '）' : ''), 'ok');
+    return d;
+  }).catch(function(e){ msg('提交下载失败：' + e.message, 'err'); });
+}
+
+/* 批量选择 */
+function dlBatchEnter(){
+  S.dlBatch = true; S.dlSel = {};
+  $('dlbar').hidden = false;
+  $('qbatch').textContent = '退出批量';
+  dlBarUpdate();
+  S.gen = -1; S.qidx = -2;      /* 强制 renderQueue 重画（否则 gen 没变它会跳过） */
+  refresh();
+}
+function dlBatchExit(){
+  S.dlBatch = false; S.dlSel = {};
+  $('dlbar').hidden = true;
+  $('qbatch').textContent = '批量下载';
+  S.gen = -1; S.qidx = -2;
+  refresh();
+}
+function dlBarUpdate(){
+  var n = Object.keys(S.dlSel).length;
+  $('dlbar-txt').textContent = '已选 ' + n + ' 首';
+  $('dlbar-go').textContent = n ? ('下载 ' + n + ' 首') : '下载';
+  $('dlbar-go').style.opacity = n ? 1 : 0.5;
+}
+$('qbatch').onclick = function(){ S.dlBatch ? dlBatchExit() : dlBatchEnter(); };
+$('dlbar-cancel').onclick = dlBatchExit;
+$('dlbar-go').onclick = function(){
+  var ids = Object.keys(S.dlSel);
+  if (!ids.length) return;
+  msg('正在提交 ' + ids.length + ' 首…');
+  var i = 0;
+  function next(){
+    if (i >= ids.length){ msg('已全部提交，进度看下面那行', 'ok'); dlBatchExit(); return; }
+    api('/v1/download/add?id=' + encodeURIComponent(ids[i++]), 20000)
+      .then(next, function(e){ msg('提交失败：' + e.message, 'err'); next(); });
+  }
+  next();
+};
+
+/* 下载状态轮询：显示进度 + 给已完成的行打勾 */
+function dlPoll(){
+  api('/v1/download/list', 10000).then(function(d){
+    var jobs = d.jobs || [];
+    var busy = jobs.filter(function(j){ return ['准备','下载中','写入标签','装入曲库','排队'].indexOf(j.state) >= 0; });
+    var done = jobs.filter(function(j){ return j.state === '完成' || j.state === '已存在'; });
+    jobs.forEach(function(j){
+      if ((j.state === '完成' || j.state === '已存在') && !S.done[j.id]){
+        S.done[j.id] = true;
+        S.gen = -1; S.qidx = -2;      /* 让行上的 ⬇ 变成 ✓ */
+        refresh();
+      }
+    });
+    var txt = '';
+    if (busy.length){
+      var j = busy[0];
+      txt = '下载中：' + (j.title || j.id) + ' ' + (j.pct || 0) + '%（队列还有 ' + Math.max(0, busy.length - 1) + '）';
+    } else if (done.length){
+      txt = '曲库已收录 ' + (d.downloaded || done.length) + ' 首（本次会话）';
+    }
+    $('dlstat').textContent = txt;
+    /* 有完成/失败的变化就轻量刷新一下列表（勾打上） */
+    var failed = jobs.filter(function(j){ return j.state === '失败'; });
+    if (failed.length && failed[0].err && failed[0]._shown !== true){
+      failed[0]._shown = true;
+      msg('下载失败：' + (failed[0].title || failed[0].id) + ' —— ' + failed[0].err, 'err');
+    }
+  }).catch(function(){});
+}
+setInterval(dlPoll, 2500);
+
+
 api('/v1/player/modes', 10000).then(function(d){ S.modes = d; renderModes(); refresh(); })
   .catch(function(e){ msg('读模式失败：' + e.message, 'err'); refresh(); });
 loadAccount();

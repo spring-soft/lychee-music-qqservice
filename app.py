@@ -60,6 +60,7 @@ from qqmusic_api.modules.song import SongFileInfo, SongFileType, SongQueryInfo
 #   它不 import 本模块（否则循环导入），QQ 那侧的取数逻辑由本文件以**回调**注入，
 #   见文件末尾的 _qq_item / _qq_url / _qq_list。
 import player
+import download
 
 logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO").upper(),
                     format="%(asctime)s %(levelname)s %(message)s")
@@ -291,9 +292,12 @@ async def lifespan(app: FastAPI):
     log.info("凭据: %s", cred_state())
     # 服务器端播放器：mpv 子进程跟着本服务一起死活（不额外多一个 daemon）
     await player.startup(_qq_item, _qq_url, _qq_list, _qq_search, MODES)
+    # 下载入库（QQ 无损 -> /mnt/usb/music/QQ下载，带封面和 UTF-8 歌词）
+    await download.startup(_qq_resolve, _qq_meta, _qq_lyric)
     try:
         yield
     finally:
+        await download.shutdown()
         await player.shutdown()
         await _state["client"].close()
 
@@ -302,6 +306,8 @@ app = FastAPI(title="ESP-Music QQ 契约层", version="1.0", lifespan=lifespan)
 
 # /v1/player/*（服务器端播放器：status/play/pause/seek/volume/queue/modes/devices）
 app.include_router(player.router)
+# /v1/download/*（把 QQ 无损下载进 Navidrome 曲库）
+app.include_router(download.router)
 
 
 # ---------------- 网页控制台 ----------------
@@ -935,6 +941,28 @@ async def _qq_search(q: str, limit: int) -> list[dict[str, Any]]:
     """搜歌 -> 队列项（服务器端播放器的搜索用，形状跟 /v1/search 一致）。"""
     r = await search(q=q, limit=limit)
     return r["items"]
+
+
+# ---------------- 下载入库用的回调（同上面的思路：QQ 取数逻辑留在本文件）----------------
+
+async def _qq_resolve(mid: str) -> dict[str, Any]:
+    """mid -> 直链（下载用；必须在下载前现取，vkey 只有 2 小时）。"""
+    return await resolve_play_url(mid, None)
+
+
+async def _qq_meta(mid: str) -> dict[str, Any]:
+    """mid -> 元数据（歌名/歌手/专辑/专辑mid/后缀），下载落盘时要写标签用。"""
+    song = await fetch_song(mid)
+    it = song_to_item(song)
+    if it is None:
+        raise HTTPException(404, f"这首歌没有可用音质（可能全都需要付费）: {mid}")
+    return it
+
+
+async def _qq_lyric(mid: str) -> str:
+    """mid -> LRC 纯文本（下载时存成同名 .lrc 旁路文件）。"""
+    r = await lyric(id=mid)
+    return r if isinstance(r, str) else ""
 
 
 
