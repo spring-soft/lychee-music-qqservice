@@ -138,6 +138,19 @@ input[type=range]::-moz-range-thumb{width:18px;height:18px;border-radius:50%;
 .msg{font-size:13px;color:var(--muted);margin-top:8px;min-height:18px;word-break:break-all;}
 .msg.err{color:var(--err);}
 .msg.ok{color:var(--ok);}
+
+/* ---------- 账号卡片 ---------- */
+.acctitle{font-size:15px;font-weight:600;}
+.acctsub{font-size:12px;color:var(--muted);margin-top:2px;}
+.acctsub.ok{color:var(--ok);}
+.acctsub.bad{color:var(--err);}
+.qrbox{display:flex;flex-direction:column;align-items:center;gap:8px;margin-top:10px;
+  padding-top:10px;border-top:1px dashed var(--line);}
+.qrbox img{width:190px;height:190px;image-rendering:pixelated;background:#fff;
+  border:1px solid var(--line);border-radius:10px;}
+.qrstate{font-size:13px;color:var(--muted);text-align:center;min-height:18px;}
+.qrstate.ok{color:var(--ok);}
+.qrstate.err{color:var(--err);}
 </style>
 </head>
 <body>
@@ -183,6 +196,22 @@ input[type=range]::-moz-range-thumb{width:18px;height:18px;border-radius:50%;
       <svg viewBox="0 0 24 24" fill="currentColor"><path d="M3 10v4h3l4 4V6L6 10H3zm12.5 2a4.5 4.5 0 0 0-2.5-4v8a4.5 4.5 0 0 0 2.5-4z"/></svg>
       <input type="range" id="vol" min="0" max="100" step="1" value="80">
       <span class="volnum" id="volnum">80</span>
+    </div>
+  </div>
+
+  <!-- QQ 音乐账号 -->
+  <div class="card">
+    <div style="display:flex;align-items:center;justify-content:space-between;gap:10px">
+      <div style="min-width:0">
+        <div class="acctitle">QQ 音乐账号</div>
+        <div class="acctsub" id="acc-sub">读取中…</div>
+      </div>
+      <button class="btn primary" id="acc-login" style="flex:none">扫码登录</button>
+    </div>
+    <div class="qrbox" id="acc-qrbox" hidden>
+      <img id="acc-img" alt="登录二维码">
+      <div class="qrstate" id="acc-state">正在获取二维码…</div>
+      <button class="btn block" id="acc-cancel">取消</button>
     </div>
   </div>
 
@@ -485,10 +514,107 @@ function renderModes(){
   }).join(' ');
 }
 
+/* ---------------- QQ 音乐账号（状态 + 扫码登录） ----------------
+ *
+ * 状态来源：GET /v1/health（凭据 present/valid/expired + VIP）
+ * 扫码：POST /v1/login/qr 拿 base64 图，然后 GET /v1/login/status 轮询
+ *   ⚠️ 取二维码**不会**动已登录的凭据（服务端只碰 login 状态，save_cred 只在
+ *      DONE 时发生），所以"已登录"状态下点"重新登录"是安全的。
+ */
+var ACC = { id: null, timer: null };
+
+function postApi(path, tmo){
+  var ctl = new AbortController();
+  var t = setTimeout(function(){ ctl.abort(); }, tmo || 30000);
+  return fetch(path, { method: 'POST', signal: ctl.signal, cache: 'no-store' })
+    .then(function(r){
+      return r.text().then(function(txt){
+        var d = null;
+        try { d = JSON.parse(txt); } catch(e){}
+        if (!r.ok) throw new Error((d && (d.error || d.detail)) || ('HTTP ' + r.status));
+        return d;
+      });
+    })
+    .finally(function(){ clearTimeout(t); });
+}
+
+function loadAccount(){
+  api('/v1/health', 10000).then(function(h){
+    var c = (h && h.credential) || {};
+    var sub = $('acc-sub'), btn = $('acc-login');
+    var ok = c.present && c.valid && !c.expired;
+    if (!c.present){
+      sub.textContent = '未登录（点右边扫码）'; sub.className = 'acctsub bad';
+    } else if (!c.valid || c.expired){
+      sub.textContent = '凭据失效/过期，需要重新扫码'; sub.className = 'acctsub bad';
+    } else {
+      var vip = ((h.vip && h.vip.truthy_keys) || []).indexOf('svip') >= 0 ? ' · 绿钻' : '';
+      sub.textContent = '已登录 · musicid ' + (c.musicid || '?') + vip;
+      sub.className = 'acctsub ok';
+    }
+    btn.textContent = ok ? '重新登录' : '扫码登录';
+  }).catch(function(e){
+    $('acc-sub').textContent = '读不到账号状态：' + e.message;
+    $('acc-sub').className = 'acctsub bad';
+  });
+}
+
+function accStop(){ if (ACC.timer){ clearInterval(ACC.timer); ACC.timer = null; } }
+function accClose(){ accStop(); ACC.id = null; $('acc-qrbox').hidden = true; }
+
+function accPoll(){
+  if (!ACC.id) return;
+  api('/v1/login/status?identifier=' + encodeURIComponent(ACC.id), 8000).then(function(s){
+    var ev = (s && s.event) || '';
+    var map = {
+      WAITING: '等待手机 QQ 音乐 App 扫码…',
+      SCAN:    '已扫码，请在手机上点确认',
+      CONF:    '正在确认…',
+      DONE:    '登录成功',
+      TIMEOUT: '二维码超时了，点「重新登录」再取一张',
+      REFUSE:  '你拒绝了这次登录',
+      STALE:   '二维码已换代，重新取一张',
+      ERROR:   '出错：' + ((s && s.error) || '')
+    };
+    var st = $('acc-state');
+    st.textContent = map[ev] || ev || '等待扫码…';
+    st.className = 'qrstate' +
+      (ev === 'DONE' ? ' ok' : (ev === 'ERROR' || ev === 'TIMEOUT' || ev === 'REFUSE') ? ' err' : '');
+    if (ev === 'DONE'){
+      accStop(); loadAccount(); setTimeout(accClose, 1200);
+      msg('QQ 音乐登录成功，凭据已保存', 'ok');
+    } else if (ev === 'TIMEOUT' || ev === 'REFUSE' || ev === 'ERROR' || ev === 'STALE'){
+      accStop();
+    }
+  }).catch(function(){});
+}
+
+$('acc-login').onclick = function(){
+  $('acc-qrbox').hidden = false;
+  $('acc-state').textContent = '正在获取二维码…';
+  $('acc-state').className = 'qrstate';
+  $('acc-img').removeAttribute('src');
+  accStop();
+  postApi('/v1/login/qr', 30000).then(function(d){
+    ACC.id = d.identifier;
+    /* ⚠️ 用 data: URL 直接显示 —— 不落任何临时文件，也不用额外接口 */
+    $('acc-img').src = 'data:' + (d.mimetype || 'image/png') + ';base64,' + d.image_base64;
+    $('acc-state').textContent = '等待手机 QQ 音乐 App 扫码…';
+    accStop();
+    ACC.timer = setInterval(accPoll, 1500);
+  }).catch(function(e){
+    $('acc-state').textContent = '取二维码失败：' + e.message;
+    $('acc-state').className = 'qrstate err';
+  });
+};
+$('acc-cancel').onclick = accClose;
+
 /* 启动 */
 api('/v1/player/modes', 10000).then(function(d){ S.modes = d; renderModes(); refresh(); })
   .catch(function(e){ msg('读模式失败：' + e.message, 'err'); refresh(); });
+loadAccount();
 setInterval(refresh, 1200);
+setInterval(loadAccount, 60000);
 </script>
 </body>
 </html>
