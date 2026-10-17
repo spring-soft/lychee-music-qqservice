@@ -51,6 +51,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import secrets
 from pathlib import Path
 from typing import Any, Awaitable, Callable
@@ -117,6 +118,42 @@ def save_cfg(cfg: dict[str, Any]) -> None:
 
 
 # ============================================================ mpv 子进程
+
+# ============================================================ USB DAC 在位检测
+#
+# ★ 为什么要自己查这个（真踩过）：
+#   DAC 被拔掉时，mpv 的 ao 直接废掉；**插回来它也不会自己恢复** ——
+#   mpv 不会重新枚举 ALSA 设备，新开的文件照样往一个已经不存在的 pcm 写，直接报错。
+#   以前的现象：拔一下 DAC，音乐停了；插回去，还是停着（除非手动重启服务）。
+#   所以：我们来当看门狗 —— 发现设备没了就记住位置停下，回来了就重起 mpv 接着放。
+
+_DAC_CARD_RE = re.compile(r"CARD=([^,]+)")
+
+
+def dac_present(device: str) -> bool:
+    """mpv --audio-device 里那个声卡现在还在不在。
+
+    device 形如 `alsa/hw:CARD=ECHOA,DEV=0`（按**名字**匹配，所以重新拔插后
+    卡号变了也不影响）。读不到 /proc/asound/cards 就返回 True —— 宁可不动，
+    也别因为读不到而把播放器锁死。
+    """
+    try:
+        txt = Path("/proc/asound/cards").read_text("utf-8", "replace")
+    except OSError:
+        return True
+    # 调试开关：data/dac_absent 存在 → 当作"没有 DAC"。
+    # 为什么要它：验证热插拔逻辑（拔掉→记住位置→插回续播）总不能让用户真的去拔线；
+    # 有这个文件就能一条命令模拟"拔掉/插回"，测完删掉即可。
+    if (DATA_DIR / "dac_absent").exists():
+        return False
+    m = _DAC_CARD_RE.search(device or "")
+    if m:
+        return m.group(1).strip().upper() in txt.upper()
+    m2 = re.search(r"hw:(\d+)", device or "")
+    if m2:
+        return re.search(r"^\s*%s\s+\[" % re.escape(m2.group(1)), txt, re.M) is not None
+    return True
+
 
 class Mpv:
     """mpv 的一层薄封装：起进程、连 IPC、发命令、收事件。
@@ -305,6 +342,21 @@ class Mpv:
                 await asyncio.wait_for(self.proc.wait(), 3)
         if self._task is not None:
             self._task.cancel()
+            self._task = None
+
+    async def restart(self) -> None:
+        """整个重起一个 mpv 进程。
+
+        什么时候需要：USB DAC 拔掉后 mpv 的 ao 已经废了，在坏进程上重新 load
+        大概率继续报错 —— 直接换一个干净的进程最省事（DAC 插回来时用）。
+        """
+        log.warning("重启 mpv 进程（%s）", self.device)
+        with contextlib.suppress(Exception):
+            await self.shutdown()
+        self._wait.clear()
+        self._load_fut = None
+        self.alive = False
+        await self.start()
 
 
 # ============================================================ Navidrome 客户端
@@ -459,6 +511,13 @@ class Player:
         self.error: str | None = None
         self.volume = int(cfg.get("volume", 80))
         self._err_streak = 0
+        # ---- USB DAC 热插拔状态（见文件上部 dac_present() 的说明）----
+        self.dac_ok = True               # DAC 现在在不在
+        self.dac_lost = False            # 是不是"因为拔 DAC 才停下的"（插回来要接着放）
+        self.dac_pos_ms = 0              # 拔掉那一刻放到哪儿了
+        self.dac_lost_idx = -1           # 拔掉时放的是队列第几首
+        self._pending_play: dict[str, Any] | None = None  # DAC 不在时记下的点播请求
+        self._dac_task: asyncio.Task | None = None
         # 下一首 URL 预取（vkey 只有 2 小时，所以只在"马上要用"时才解）
         self._next_url: str | None = None
         self._next_idx = -1
@@ -578,6 +637,16 @@ class Player:
 
     async def _on_end(self, reason: str) -> None:
         """mpv 播完一首（或出错）。reason 只有 eof/error 会进来（stop 被过滤掉了）。"""
+        # ★ DAC 拔掉引起的 error 不是"播放失败"：
+        #   不计入连续失败、也**不要自动切下一首**（切了也一样出不了声，还会把队列刷乱）。
+        if reason == "error" and not dac_present(self.mpv.device):
+            pos = 0
+            with contextlib.suppress(Exception):
+                tp = await self.mpv.get("time-pos")
+                if tp is not None:
+                    pos = int(float(tp) * 1000)
+            self._mark_dac_lost(pos)
+            return
         async with self.lock:
             if reason == "error":
                 self._err_streak += 1
@@ -597,6 +666,118 @@ class Player:
             except Exception as e:                      # noqa: BLE001
                 log.warning("自动切下一首失败: %s", e)
 
+    # ---- USB DAC 热插拔（看门狗）----
+    def start_dac_watch(self) -> None:
+        """启动看门狗。开机时 DAC 就不在也照样起 —— 点播时给明确的提示，插上自动开始。"""
+        self.dac_ok = dac_present(self.mpv.device)
+        if not self.dac_ok:
+            log.warning("启动时没找到 USB DAC（%s）—— 插上后就能播", self.mpv.device)
+        self._dac_task = asyncio.create_task(self._dac_watch())
+
+    async def _dac_watch(self) -> None:
+        while True:
+            await asyncio.sleep(1.5)
+            try:
+                ok = dac_present(self.mpv.device)
+            except Exception:                       # noqa: BLE001
+                continue
+            if ok == self.dac_ok:
+                continue
+            if ok:
+                await self._dac_back()
+            else:
+                await self._dac_lost()
+
+    def _mark_dac_lost(self, pos_ms: int = 0) -> None:
+        if not self.dac_ok and self.dac_lost:
+            return                                   # 已经处理过，别刷日志
+        self.dac_ok = False
+        self.dac_lost = True
+        self.dac_lost_idx = self.index
+        self.dac_pos_ms = max(0, int(pos_ms))
+        self.error = "USB DAC 已拔出（插上会自动继续）"
+        log.warning("USB DAC 拔掉了（%s）：停在 %d.%03d 秒，插回来会接着放",
+                    self.mpv.device, self.dac_pos_ms // 1000, self.dac_pos_ms % 1000)
+
+    async def _dac_lost(self) -> None:
+        pos = 0
+        if self.mpv.alive:
+            with contextlib.suppress(Exception):
+                tp = await self.mpv.get("time-pos")
+                if tp is not None:
+                    pos = int(float(tp) * 1000)
+        self._mark_dac_lost(pos)
+        # 让 mpv 空闲下来：别对着一个已经不存在的 pcm 一直写、一直报错刷日志
+        if self.mpv.alive:
+            with contextlib.suppress(Exception):
+                await self.mpv.stop()
+
+    async def _dac_back(self) -> None:
+        self.dac_ok = True
+        log.warning("USB DAC 插回来了（%s）", self.mpv.device)
+
+        # ① DAC 不在的时候用户点过播 → 现在补上
+        pending, self._pending_play = self._pending_play, None
+        if pending:
+            try:
+                if pending.get("kind") == "id":
+                    await self.play_id(pending["source"], pending["id"])
+                else:
+                    await self.play_mode(pending["source"], pending["mode"],
+                                         pending.get("index", 0),
+                                         pending.get("limit", 60),
+                                         pending.get("skip", 0))
+                self.dac_lost = False
+                self.error = None
+                log.warning("DAC 插回后按「等待中的点播请求」开播：%s",
+                            pending.get("mode") or pending.get("id"))
+                return
+            except Exception as e:                  # noqa: BLE001
+                log.warning("DAC 插回后补播失败: %s", e)
+
+        # ② 拔掉时正在放的那首 → 接着放
+        idx = self.dac_lost_idx
+        if not self.dac_lost or not (0 <= idx < len(self.queue)):
+            self.dac_lost = False
+            return
+        async with self.lock:
+            item = self.queue[idx]
+            self.index = idx
+            # ⚠️ Navidrome 带 timeOffset 会让服务器转码 → 破坏"无损"，
+            #    所以 Nav 来源**从头重放**（跟"切回本机保证无损"一个逻辑）；
+            #    QQ 是静态文件（mpv 走 HTTP Range），可以真的续播。
+            pos = self.dac_pos_ms if int(item.get("back") or 0) == 1 else 0
+            self.dac_lost = False
+            self.dac_pos_ms = 0
+            note = ("从 %.1f 秒继续" % (pos / 1000.0)) if pos else "从头重放（保证无损）"
+            try:
+                url = await self._url_of(item)
+                await self.mpv.ensure()
+                await self.mpv.load(url, start_ms=pos)
+                self.error = None
+                log.warning("DAC 恢复播放：%s - %s（%s）",
+                            item.get("title"), item.get("artist"), note)
+            except Exception as e:                  # noqa: BLE001
+                # ao 已经废了：整个重起 mpv 再试一次
+                log.warning("DAC 恢复首次失败，重起 mpv 再试: %s", e)
+                try:
+                    await self.mpv.restart()
+                    url = await self._url_of(item)
+                    await self.mpv.load(url, start_ms=pos)
+                    self.error = None
+                    log.warning("DAC 恢复播放（重起 mpv 后成功）：%s", item.get("title"))
+                except Exception as e2:             # noqa: BLE001
+                    self.error = f"DAC 插回来了但恢复播放失败：{e2}"
+                    log.error("%s", self.error)
+
+    def _need_dac(self, pending: dict[str, Any] | None = None) -> None:
+        """DAC 不在就别去开播（顺手记下请求，插上自动播）。"""
+        if self.dac_ok:
+            return
+        if pending is not None:
+            self._pending_play = pending
+        raise HTTPException(503, "USB DAC 没插（插上会自动开始播放）")
+
     async def play_mode(self, source: str, mode: str, index: int, limit: int,
                         skip: int = 0) -> dict[str, Any]:
         """按模式建队列并开播。
@@ -609,6 +790,8 @@ class Player:
             label, items = await self._list(source, mode, limit)
             if not items:
                 raise HTTPException(404, f"{source}/{mode} 没取到歌")
+            self._need_dac({"kind": "mode", "source": source, "mode": mode,
+                            "index": index, "limit": limit, "skip": skip})
             self.source = source
             self.mode_key = mode
             self.mode_label = label
@@ -621,6 +804,7 @@ class Player:
         return await self.status()
 
     async def play_id(self, source: str, sid: str) -> dict[str, Any]:
+        self._need_dac({"kind": "id", "source": source, "id": sid})
         if source == "qq":
             assert self.qq_item is not None
             item = _qq_item(await self.qq_item(sid))
@@ -646,6 +830,7 @@ class Player:
         return await self.status()
 
     async def step(self, delta: int) -> dict[str, Any]:
+        self._need_dac()
         async with self.lock:
             if not self.queue:
                 raise HTTPException(409, "队列是空的，先挑个列表或单曲")
@@ -724,10 +909,18 @@ class Player:
             "gen": self.gen, "mpv_ok": self.mpv.alive,
             "device_id": self.mpv.device, "error": self.error,
             "audio": {},
+            # ★ USB DAC 在位状态：拔掉时网页/设备能直接显示"插上会自动继续"，
+            #   而不是让人以为播放器坏了。
+            "dac": {"present": self.dac_ok, "device": self.mpv.device},
         }
         if 0 <= self.index < len(self.queue):
             st["song"] = self.queue[self.index]
             st["dur_ms"] = int(self.queue[self.index].get("dur_ms") or 0)
+        if not self.dac_ok:
+            st["state"] = "paused"
+            st["pos_ms"] = self.dac_pos_ms
+            st["error"] = self.error or "USB DAC 已拔出（插上会自动继续）"
+            return st
         if not self.mpv.alive:
             return st
         try:
@@ -931,7 +1124,6 @@ async def startup(qq_item, qq_url, qq_list, qq_search,
     p = Player(cfg, mpv, nav)
     p.qq_item, p.qq_url, p.qq_list, p.qq_search = qq_item, qq_url, qq_list, qq_search
     _player = p
-
     # mpv 起不来不要让整个服务挂掉 —— /v1/* 的 QQ 契约接口还得能用
     try:
         await mpv.start()
@@ -946,10 +1138,16 @@ async def startup(qq_item, qq_url, qq_list, qq_search,
     else:
         log.warning("没配 Navidrome 账号（data/player.json 的 nav 段），nav 来源不可用")
 
+    # USB DAC 看门狗：拔掉→记住位置停下；插回→重起 mpv 接着放。
+    # 开机时 DAC 就不在也没关系（mpv 照常起来待命，点播时给明确提示）。
+    p.start_dac_watch()
+
 
 async def shutdown() -> None:
     if _player is None:
         return
+    if _player._dac_task is not None:
+        _player._dac_task.cancel()
     with contextlib.suppress(Exception):
         _player.cfg["volume"] = _player.volume
         save_cfg(_player.cfg)

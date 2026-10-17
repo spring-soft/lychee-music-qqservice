@@ -276,7 +276,7 @@ input[type=range]::-moz-range-thumb{width:18px;height:18px;border-radius:50%;
    ⚠️ 本服务没有鉴权，同网段能打开这个页面的人都能控制播放 —— 既有约定。
    ============================================================ */
 var S = { back: 1, gen: -1, modes: null, stat: null, dragging: false, volTimer: null,
-          modeOf: {}, backPending: null, backPendingAt: 0 };
+          modeOf: {}, backPending: null, backPendingAt: 0, dacWarned: false };
 
 function $(id){ return document.getElementById(id); }
 function esc(s){ return String(s == null ? '' : s).replace(/[&<>"]/g, function(c){
@@ -347,6 +347,19 @@ function render(st){
   $('sub').textContent = (st.mpv_ok ? (playing ? '正在播放' : paused ? '已暂停' : '待机')
       : '播放器不可用') + ' · ' + (st.device_id || '').replace('alsa/', '');
   $('offline').hidden = true;
+
+  /* USB DAC 拔掉/插回：明确告诉用户"服务器记住了位置，插上会自动继续"，
+   * 否则只会看到"已暂停"，还以为播放器坏了。 */
+  var dacPresent = (st.dac && st.dac.present !== undefined) ? st.dac.present : true;
+  if (!dacPresent && !S.dacWarned){
+    S.dacWarned = true;
+    $('dot').className = 'dot bad';
+    $('sub').textContent = 'USB DAC 已拔出 —— 插上会自动继续';
+    msg(st.error || 'USB DAC 已拔出（插上会自动继续播放）', 'err');
+  } else if (dacPresent && S.dacWarned){
+    S.dacWarned = false;
+    msg('USB DAC 已插回，已自动恢复播放', 'ok');
+  }
 
   $('title').textContent = has ? (song.title || '') : '未在播放';
   $('artist').textContent = has ? (song.artist || '') : '';
