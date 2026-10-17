@@ -612,14 +612,19 @@ async def modes() -> dict[str, Any]:
 
 
 @app.get("/v1/list")
-async def list_by_mode(mode: str = Query(...), limit: int = 30,
+async def list_by_mode(mode: str = Query(...), limit: int = 30, page: int = 1,
                        quality: str | None = None) -> dict[str, Any]:
-    """按模式取歌单。**所有模式返回同一个结构**，固件只写一套解析。"""
+    """按模式取歌单。**所有模式返回同一个结构**，固件只写一套解析。
+
+    page 只对**能分页**的模式有效（收藏 / 卡片歌单）；刷歌/雷达是每次随机，
+    传 page 也不会变 —— 想要"加载更多"由播放器那边追加新条目去做。
+    """
     limit = max(1, min(limit, 100))
+    page = max(1, page)
     try:
         if mode == "fav":
             # 复用 favorites() 的取数逻辑，但**统一成同一结构**（固件只写一套解析）
-            fav = await favorites(limit=limit, quality=quality)
+            fav = await favorites(limit=limit, page=page, quality=quality)
             return {"mode": "fav", "label": "收藏", "items": fav["items"],
                     "count": fav["count"]}
 
@@ -631,7 +636,7 @@ async def list_by_mode(mode: str = Query(...), limit: int = 30,
             if sid is None:
                 raise HTTPException(502, f"首页 Feed 里没有「{title}」卡片（上游改版了？）")
             r = await _retry(lambda: _state["client"].songlist.get_detail(
-                songlist_id=sid, num=limit, page=1))
+                songlist_id=sid, num=limit, page=page))
             songs = getattr(r, "songs", None) or []
             label = title
 
@@ -755,7 +760,7 @@ def _lrc_to_normalized(lrc: str) -> dict[str, Any]:
 # ---------------- "我喜欢"（读 + 加；**不能删**，见 /v1/favorite 那段的说明） ----------------
 
 @app.get("/v1/favorites")
-async def favorites(limit: int = 50, quality: str | None = None) -> dict[str, Any]:
+async def favorites(limit: int = 50, page: int = 1, quality: str | None = None) -> dict[str, Any]:
     """读 QQ 账号的"我喜欢"（dirid=201）。
 
     写回见 `POST /v1/favorite`：**能加，不能删**（上游对 dirId=201 的删除静默忽略）。
@@ -767,9 +772,10 @@ async def favorites(limit: int = 50, quality: str | None = None) -> dict[str, An
     """
     cred = cred_or_401()
     limit = max(1, min(limit, 100))
+    page = max(1, page)
     try:
         resp = await _state["client"].user.get_fav_song(
-            euin=cred.encrypt_uin, num=limit, credential=cred,
+            euin=cred.encrypt_uin, page=page, num=limit, credential=cred,
         )
     except (CredentialExpiredError, CredentialInvalidError) as e:
         raise HTTPException(401, f"凭据失效，重新扫码: {e}") from e
@@ -931,9 +937,9 @@ async def _qq_url(mid: str) -> str:
     return r["url"]
 
 
-async def _qq_list(mode: str, limit: int) -> tuple[str, list[dict[str, Any]]]:
+async def _qq_list(mode: str, limit: int, page: int = 1) -> tuple[str, list[dict[str, Any]]]:
     """mode -> (中文名, 队列项)。直接复用 /v1/list 的取数逻辑，形状天然一致。"""
-    r = await list_by_mode(mode=mode, limit=limit)
+    r = await list_by_mode(mode=mode, limit=limit, page=page)
     return r["label"], r["items"]
 
 

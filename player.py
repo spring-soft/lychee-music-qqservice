@@ -451,6 +451,7 @@ class Player:
         self.lock = asyncio.Lock()
         self.queue: list[dict[str, Any]] = []
         self.index = -1
+        self.page = 1                    # 已加载到第几页（「加载更多」用）
         self.source: str | None = None
         self.mode_key = ""
         self.mode_label = ""
@@ -470,15 +471,56 @@ class Player:
         self.mpv.on_end = self._on_end
 
     # ---- 取数/解地址 ----
-    async def _list(self, source: str, mode: str, limit: int) -> tuple[str, list[dict[str, Any]]]:
+    async def _list(self, source: str, mode: str, limit: int,
+                    page: int = 1) -> tuple[str, list[dict[str, Any]]]:
         if source == "qq":
             assert self.qq_list is not None
-            label, items = await self.qq_list(mode, limit)
+            label, items = await self.qq_list(mode, limit, page)
             return label, [_qq_item(it) for it in items]
 
         if self.nav is None:
             raise HTTPException(503, "这台服务器没配置 Navidrome 账号（data/player.json 的 nav 段）")
         return await self.nav.list_mode(mode, limit)
+
+    async def more(self, n: int = 60) -> dict[str, Any]:
+        """列表「加载更多」：把当前模式**下一页**追加到队列尾部。
+
+        为什么要这个：一开始只建 60 首的队列，用户滚到底就没得看了
+        （收藏有 64 首就会少 4 首，歌单多的时候更惨）。
+        QQ 的收藏/卡片歌单都支持 page（get_fav_song(page=) / get_detail(page=)），
+        所以下一页是真·下一页；刷歌/雷达是每次随机，只能"再抽一批、去重后追加"。
+        Navidrome 那三个模式没有分页概念 → 直接返回 exhausted。
+        """
+        async with self.lock:
+            if not self.queue or not self.source:
+                raise HTTPException(409, "还没有列表，先挑个模式或搜索")
+            if self.source != "qq":
+                return {"ok": True, "added": 0, "exhausted": True,
+                        "count": len(self.queue)}
+            page = self.page + 1
+            try:
+                _label, items = await self._list("qq", self.mode_key, n, page)
+            except HTTPException:
+                raise
+            except Exception as e:                          # noqa: BLE001
+                raise HTTPException(502, f"取下一页失败: {type(e).__name__}: {e}") from e
+            have = {(it.get("back"), it.get("id")) for it in self.queue}
+            added = 0
+            for it in items:
+                k = (it.get("back"), it.get("id"))
+                if k in have:
+                    continue
+                have.add(k)
+                self.queue.append(it)
+                added += 1
+            self.page = page
+            if added:
+                self.gen += 1            # 让客户端知道队列变了（ESP 会重新镜像前 64 首）
+            log.info("加载更多：page=%d 取到 %d 首，新增 %d 首，队列共 %d 首",
+                     page, len(items), added, len(self.queue))
+            return {"ok": True, "added": added,
+                    "exhausted": added == 0, "count": len(self.queue),
+                    "page": self.page}
 
     async def search(self, source: str, q: str, limit: int) -> list[dict[str, Any]]:
         q = (q or "").strip()
@@ -571,6 +613,7 @@ class Player:
             self.mode_key = mode
             self.mode_label = label
             self.queue = items
+            self.page = 1
             self.gen += 1
             self._next_url, self._next_idx = None, -1
             start = max(0, min(index + max(0, skip), len(items) - 1))
@@ -790,7 +833,14 @@ async def player_volume(level: int = Query(...)) -> dict[str, Any]:
 async def player_queue() -> dict[str, Any]:
     p = get_player()
     return {"source": p.source, "mode": p.mode_label, "mode_key": p.mode_key,
-            "index": p.index, "count": len(p.queue), "gen": p.gen, "items": p.queue}
+            "index": p.index, "count": len(p.queue), "page": p.page,
+            "gen": p.gen, "items": p.queue}
+
+
+@router.get("/more")
+async def player_more(n: int = 60) -> dict[str, Any]:
+    """列表加载更多：把当前模式下一页追加进队列（网页往下滚到底时调）。"""
+    return await get_player().more(max(10, min(n, 100)))
 
 
 @router.get("/modes")

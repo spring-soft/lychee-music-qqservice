@@ -316,6 +316,10 @@ function renderQueue(st){
       return;
     }
     $('qhead').textContent = '队列 · ' + (d.mode || '') + ' · ' + d.count + ' 首';
+    /* 整个队列里一首 QQ 歌都没有（比如来源就是 Navidrome）→ 连"批量下载"入口都收起来 */
+    var hasQQ = (d.items || []).some(function(x){ return (x.back | 0) === 1; });
+    $('qbatch').style.display = hasQQ ? '' : 'none';
+    if (!hasQQ && S.dlBatch) dlBatchExit();
     el.innerHTML = d.items.map(function(it, i){
       return '<div class="row' + (i === d.index ? ' on' : '') + '" data-i="' + i +
         '" data-id="' + esc(it.id) + '" data-back="' + (it.back|0) + '">' +
@@ -323,6 +327,14 @@ function renderQueue(st){
         '<div class="rsub">' + esc(it.artist || '') + (it.temp ? '' : '') + '</div></div>' +
         '<div class="rdur">' + mmss(it.dur_ms) + '</div>' + dlCell(it) + '</div>';
     }).join('');
+    /* 底部：能分页的来源给个"加载更多"（滚到底也会自动触发），到期了就说一声 */
+    if (d.source === 'qq'){
+      el.innerHTML += S.exhausted
+        ? '<div class="empty">这个列表已经到头了</div>'
+        : '<button class="more" id="qmore" style="width:100%;padding:12px;border-radius:10px;' +
+          'background:var(--accent-bg);color:var(--accent);font-weight:600;font-size:13px">' +
+          '加载更多…（当前 ' + d.count + ' 首）</button>';
+    }
   }).catch(function(){});
 }
 
@@ -418,6 +430,7 @@ function cmd(path){
 
 function playMode(mode){
   var src = S.back === 1 ? 'qq' : 'nav';
+  S.exhausted = false;                    /* 新列表：允许继续加载更多 */
   msg('正在准备队列…');
   api('/v1/player/play?source=' + src + '&mode=' + encodeURIComponent(mode) +
       '&index=0&limit=60&skip=' + (S.back === 1 && mode === 'fav' ? 0 : 0), 30000)
@@ -548,6 +561,7 @@ $('modes').onclick = function(ev){
  *   点行    = 播放（批量模式下不播，避免误触） */
 function listClick(ev){
   var t = ev.target;
+  if (t && t.id === 'qmore'){ loadMore(); return; }
   var dl = t.closest ? t.closest('button.rdl') : null;
   if (dl){ dlAdd(dl.dataset.id); return; }
   var ck = t.closest ? t.closest('input.ck') : null;
@@ -714,11 +728,13 @@ S.done = {};         /* id -> true（已知下载完成的，给行上打勾） 
 function dlCell(it){
   var id = it && it.id || '';
   if (!id) return '<div></div>';
+  /* ★ 来源是 Navidrome（back=0）时**不给任何下载控件** —— 它的歌本来就在曲库里。
+   *   批量模式下也一样（以前这里漏了，Nav 的行也会长出勾选框）。 */
+  if ((it.back | 0) !== 1) return '<div></div>';
   if (S.dlBatch){
     var on = S.dlSel[id] ? ' checked' : '';
     return '<div class="rdl"><input type="checkbox" class="ck" data-id="' + esc(id) + '"' + on + '></div>';
   }
-  if ((it.back | 0) !== 1) return '<div></div>';        /* Navidrome 的不用下 */
   var done = S.done[id] ? ' done' : '';
   return '<button class="rdl' + done + '" data-id="' + esc(id) + '" title="下载到 Navidrome 曲库">⬇</button>';
 }
@@ -802,6 +818,41 @@ function dlPoll(){
 setInterval(dlPoll, 2500);
 
 
+/* ---------------- 加载更多（队列滚到底自动续） ----------------
+ * 以前队列只建 60 首，滚到底就没了（收藏有 64 首会少 4 首，歌单更长时更明显）。
+ * 现在滚到接近底部就调 /v1/player/more，让服务器把**下一页**追加进队列。
+ * Navidrome 的来源没有分页概念 → 服务器直接回 exhausted，这里就不再加。
+ */
+S.moreBusy = false;
+S.exhausted = false;
+
+function loadMore(){
+  if (S.moreBusy || S.exhausted) return;
+  if (!S.stat || S.stat.source !== 'qq'){ S.exhausted = true; return; }
+  S.moreBusy = true;
+  api('/v1/player/more?n=60', 45000).then(function(d){
+    S.moreBusy = false;
+    S.exhausted = !!(d && d.exhausted);
+    if (d && d.added > 0) msg('已加载更多：+' + d.added + ' 首（共 ' + d.count + ' 首）', 'ok');
+    else if (S.exhausted) msg('这个列表已经到头了', 'ok');
+    S.gen = -1; S.qidx = -2;
+    refresh();
+  }).catch(function(e){
+    S.moreBusy = false;
+    msg('加载更多失败：' + e.message, 'err');
+  });
+}
+
+/* 滚到底自动加载（离底 60px 就触发，别等真的到底） */
+(function(){
+  var el = document.getElementById('queue');
+  if (!el) return;
+  el.addEventListener('scroll', function(){
+    if (el.scrollTop + el.clientHeight >= el.scrollHeight - 60) loadMore();
+  });
+})();
+
+/* 启动 */
 api('/v1/player/modes', 10000).then(function(d){ S.modes = d; renderModes(); refresh(); })
   .catch(function(e){ msg('读模式失败：' + e.message, 'err'); refresh(); });
 loadAccount();
