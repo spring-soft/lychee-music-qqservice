@@ -178,9 +178,6 @@ input[type=range]::-moz-range-thumb{width:18px;height:18px;border-radius:50%;
       <button class="iconbtn" id="next" title="下一首">
         <svg viewBox="0 0 24 24" fill="currentColor"><path d="M16 5h2v14h-2zM6 5l9 7-9 7z"/></svg>
       </button>
-      <button class="iconbtn" id="stop" title="停止">
-        <svg viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="6" width="12" height="12" rx="2"/></svg>
-      </button>
     </div>
     <div class="volrow">
       <svg viewBox="0 0 24 24" fill="currentColor"><path d="M3 10v4h3l4 4V6L6 10H3zm12.5 2a4.5 4.5 0 0 0-2.5-4v8a4.5 4.5 0 0 0 2.5-4z"/></svg>
@@ -378,7 +375,6 @@ $('play').onclick = function(){
 };
 $('prev').onclick = function(){ cmd('/v1/player/prev'); };
 $('next').onclick = function(){ cmd('/v1/player/next'); };
-$('stop').onclick = function(){ cmd('/v1/player/stop'); };
 
 /* 进度条：按下/拖动就地更新，松手才真的发 seek */
 (function(){

@@ -316,7 +316,9 @@ async def console_index() -> Any:
     f = WWW_DIR / "index.html"
     if not f.exists():
         raise HTTPException(404, f"控制台页面不存在：{f}")
-    return HTMLResponse(f.read_text("utf-8"))
+    # ⚠️ no-cache：页面是"每次请求现读磁盘"的，加了这个以后改版不用教客户硬刷新
+    return HTMLResponse(f.read_text("utf-8"),
+                        headers={"Cache-Control": "no-cache"})
 
 
 @app.get("/favicon.ico")
