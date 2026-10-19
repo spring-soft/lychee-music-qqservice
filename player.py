@@ -504,6 +504,7 @@ class Player:
         self.queue: list[dict[str, Any]] = []
         self.index = -1
         self.page = 1                    # 已加载到第几页（「加载更多」用）
+        self.exhausted = False           # 当前模式的列表是不是已经取到头（更多也加不出新歌）
         self.source: str | None = None
         self.mode_key = ""
         self.mode_label = ""
@@ -541,6 +542,41 @@ class Player:
             raise HTTPException(503, "这台服务器没配置 Navidrome 账号（data/player.json 的 nav 段）")
         return await self.nav.list_mode(mode, limit)
 
+    async def _more_locked(self, n: int) -> int:
+        """（调用方必须持有 self.lock）把当前模式下一页追加到队列尾，返回新增首数。
+
+        QQ 的三种情形：
+          · 收藏 / 卡片歌单：下一页是真·下一页（page+1）
+          · 刷歌 / 雷达：上游每次随机给一小批（实测刷歌 5 首、雷达 10 首），
+            只能"再抽一批、去重后追加"
+          · Navidrome 的三个模式没有分页概念 → 直接 0
+        """
+        if not self.queue or self.source != "qq":
+            return 0
+        page = self.page + 1
+        try:
+            _label, items = await self._list("qq", self.mode_key, n, page)
+        except Exception as e:                          # noqa: BLE001
+            log.info("加载更多失败（保持现有队列）: %s", e)
+            return 0
+        have = {(it.get("back"), it.get("id")) for it in self.queue}
+        added = 0
+        for it in items:
+            k = (it.get("back"), it.get("id"))
+            if k in have:
+                continue
+            have.add(k)
+            self.queue.append(it)
+            added += 1
+        self.page = page
+        if added:
+            self.gen += 1            # 让客户端知道队列变了
+        self.exhausted = (added == 0)
+        log.info("加载更多：page=%d 取到 %d 首，新增 %d 首，队列共 %d 首%s",
+                 page, len(items), added, len(self.queue),
+                 "（已到头）" if self.exhausted else "")
+        return added
+
     async def more(self, n: int = 60) -> dict[str, Any]:
         """列表「加载更多」：把当前模式**下一页**追加到队列尾部。
 
@@ -556,29 +592,9 @@ class Player:
             if self.source != "qq":
                 return {"ok": True, "added": 0, "exhausted": True,
                         "count": len(self.queue)}
-            page = self.page + 1
-            try:
-                _label, items = await self._list("qq", self.mode_key, n, page)
-            except HTTPException:
-                raise
-            except Exception as e:                          # noqa: BLE001
-                raise HTTPException(502, f"取下一页失败: {type(e).__name__}: {e}") from e
-            have = {(it.get("back"), it.get("id")) for it in self.queue}
-            added = 0
-            for it in items:
-                k = (it.get("back"), it.get("id"))
-                if k in have:
-                    continue
-                have.add(k)
-                self.queue.append(it)
-                added += 1
-            self.page = page
-            if added:
-                self.gen += 1            # 让客户端知道队列变了（ESP 会重新镜像前 64 首）
-            log.info("加载更多：page=%d 取到 %d 首，新增 %d 首，队列共 %d 首",
-                     page, len(items), added, len(self.queue))
+            added = await self._more_locked(n)
             return {"ok": True, "added": added,
-                    "exhausted": added == 0, "count": len(self.queue),
+                    "exhausted": self.exhausted, "count": len(self.queue),
                     "page": self.page}
 
     async def search(self, source: str, q: str, limit: int) -> list[dict[str, Any]]:
@@ -661,8 +677,16 @@ class Player:
             if self.index < 0:
                 return
             # ⚠️ 这里在后台任务里（mpv 事件触发的），抛出去没人接 —— 必须自己兜住
+            # ★ 播到队列最后一首时先**自动续一批**再继续，别回头从头放（用户要求：
+            #   刷歌只有 5 首，播到底要能接着取；收藏/歌单同理）。
+            nxt = (self.index + 1) % len(self.queue)
+            if self.index >= len(self.queue) - 1 and self.source == "qq" and not self.exhausted:
+                added = await self._more_locked(30)
+                if added:
+                    nxt = len(self.queue) - added     # 第一首新加的
+                    log.warning("列表到底 → 自动续了 %d 首，接着放第 %d 首", added, nxt + 1)
             try:
-                await self._start_index((self.index + 1) % len(self.queue))
+                await self._start_index(nxt)
             except Exception as e:                      # noqa: BLE001
                 log.warning("自动切下一首失败: %s", e)
 
@@ -797,6 +821,7 @@ class Player:
             self.mode_label = label
             self.queue = items
             self.page = 1
+            self.exhausted = False
             self.gen += 1
             self._next_url, self._next_idx = None, -1
             start = max(0, min(index + max(0, skip), len(items) - 1))
@@ -824,6 +849,8 @@ class Player:
             self.source = source
             self.mode_key = "single"
             self.mode_label = "单曲"
+            self.page = 1
+            self.exhausted = True        # 单曲没有"下一页"
             self.gen += 1
             self._next_url, self._next_idx = None, -1
             await self._start_index(at)
@@ -905,7 +932,8 @@ class Player:
             "song": {},
             "queue": {"index": self.index, "count": len(self.queue),
                       "mode": self.mode_label, "mode_key": self.mode_key,
-                      "back": 1 if self.source == "qq" else 0 if self.source else -1},
+                      "back": 1 if self.source == "qq" else 0 if self.source else -1,
+                      "page": self.page, "exhausted": self.exhausted},
             "gen": self.gen, "mpv_ok": self.mpv.alive,
             "device_id": self.mpv.device, "error": self.error,
             "audio": {},
