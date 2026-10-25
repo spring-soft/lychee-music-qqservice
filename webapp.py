@@ -110,7 +110,8 @@ async def lifespan(_: FastAPI):
     conf = load_web_conf()
     user = str(conf.get("user") or "")
     pw = str(conf.get("password") or "")
-    subsonic_api.configure(user, pw, bool(conf.get("star_write", True)))
+    subsonic_api.configure(user, pw, bool(conf.get("star_write", True)),
+                           str(conf.get("server_type") or "") or None)
     websession.configure(user, pw)
     if not user or not pw:
         log.error("❌ 没有配置网页账号：请写 %s（{\"user\":..., \"password\":...}）", WEB_CONF)

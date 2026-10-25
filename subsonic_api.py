@@ -47,14 +47,20 @@ router = APIRouter()
 # 网页/客户端共用的 Subsonic 账号（webapp.py 启动时从 data/web.json 注入）
 _users: dict[str, str] = {}
 _star_write = True
+# ping 里报告的服务器类型。有的客户端会按 type 做特判（认不出就报奇怪的错），
+# 所以做成可配置：data/web.json 里加 "server_type": "navidrome" 即可切换，默认 qqmusic。
+_server_type = "qqmusic"
 
 
-def configure(user: str, password: str, star_write: bool = True) -> None:
-    global _star_write
+def configure(user: str, password: str, star_write: bool = True,
+              server_type: str | None = None) -> None:
+    global _star_write, _server_type
     _users.clear()
     if user and password:
         _users[user] = password
     _star_write = bool(star_write)
+    if server_type:
+        _server_type = server_type
 
 
 # ------------------------------------------------------------------ 响应封装
@@ -69,8 +75,11 @@ class SubError(Exception):
 
 
 def _envelope(payload: dict[str, Any] | None = None, *, status: str = "ok") -> dict[str, Any]:
+    # openSubsonic=True：我们实现了 OpenSubsonic 的 songLyrics 扩展，
+    # 部分客户端（含 CloudPureMusic）会看这个标志决定后续走哪套流程。
     r: dict[str, Any] = {"status": status, "version": API_VERSION,
-                         "type": SERVER_TYPE, "serverVersion": SERVER_VERSION}
+                         "type": _server_type, "serverVersion": SERVER_VERSION,
+                         "openSubsonic": True}
     if payload:
         r.update(payload)
     return {"subsonic-response": r}
@@ -810,8 +819,9 @@ async def _handle(request: Request, method: str) -> Response:
         if method not in ("getCoverArt", "getAvatar"):
             ip = (request.headers.get("x-forwarded-for") or "").split(",")[0].strip() \
                 or (request.client.host if request.client else "-")
-            log.info("REQ %-20s c=%-16s u=%-10s ip=%-15s args=%s ua=%r",
-                     method, str(p.get("c") or "-")[:16], str(p.get("u") or "-")[:10], ip,
+            log.info("REQ %-20s c=%-16s u=%-10s v=%-7s ip=%-15s args=%s ua=%r",
+                     method, str(p.get("c") or "-")[:16], str(p.get("u") or "-")[:10],
+                     str(p.get("v") or "-")[:7], ip,
                      json.dumps({k: v for k, v in p.items()
                                  if k in ("id", "query", "songCount", "size", "username",
                                           "playlistId", "format", "maxBitRate")},
