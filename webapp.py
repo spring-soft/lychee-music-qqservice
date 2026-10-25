@@ -103,7 +103,7 @@ async def _warm_loop() -> None:
             await subsonic_api.warm_playlists()
         except Exception as e:                              # noqa: BLE001
             log.warning("歌单预热失败: %s", e)
-        await asyncio.sleep(300)
+        await asyncio.sleep(600)
 
 
 @asynccontextmanager
@@ -134,6 +134,12 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(title="QQ 音乐（Navidrome 风格）", version="1.0", lifespan=lifespan,
               docs_url=None, redoc_url=None, openapi_url=None)
+
+# ★ gzip：收藏歌单 JSON 未压缩约 424KB，压完约 40KB。
+#   公网链路是「Cloudflare → 家里上行 → 服务器」，压缩放在源头收益最大（实测 4.1s → 1.x s）。
+from starlette.middleware.gzip import GZipMiddleware        # noqa: E402
+
+app.add_middleware(GZipMiddleware, minimum_size=1024, compresslevel=5)
 
 app.include_router(subsonic_api.router, prefix="/rest")
 

@@ -234,65 +234,101 @@ _PLAYLIST_MAX = 2000         # 上限，防止某个模式无限翻页
 _PLAYLIST_PAGE = 100         # /v1/list 单页上限
 _PLAYLIST_KINDS_PAGED = {"fav", "daily", "million", "newrec"}   # 能真翻页的模式
 
+# (写入时间, 歌曲列表, 是否占用中的刷新标记由 _pc_busy 管)
 _pc: dict[str, tuple[float, list[dict[str, Any]]]] = {}
 _pc_lock = asyncio.Lock()
+_pc_busy: set[str] = set()          # 正在后台刷新的模式，防止重复发起
+
+
+async def _fetch_full_mode(mode: str) -> list[dict[str, Any]]:
+    """真正去上游翻页取整份歌单（调用方负责 _pc_lock / _pc 更新）。"""
+    items: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    pages = 20 if mode in _PLAYLIST_KINDS_PAGED else 1
+    for page in range(1, pages + 1):
+        r = await core.list_by_mode(mode=mode, limit=_PLAYLIST_PAGE, page=page)
+        batch = r.get("items") or []
+        added = 0
+        for it in batch:
+            sid = it.get("id") or ""
+            if not sid or sid in seen:
+                continue
+            seen.add(sid)
+            items.append(it)
+            added += 1
+            if len(items) >= _PLAYLIST_MAX:
+                break
+        log.info("整份歌单 %s: page=%d 取到 %d 首，新增 %d，累计 %d",
+                 mode, page, len(batch), added, len(items))
+        if len(items) >= _PLAYLIST_MAX:
+            break
+        if len(batch) < _PLAYLIST_PAGE:      # 不足一页 = 到头了
+            break
+        if added == 0:                       # 翻页没带来新歌（随机模式）→ 停
+            break
+    return _songs(items, starred=(mode == "fav"))
+
+
+async def _refresh_mode(mode: str) -> list[dict[str, Any]]:
+    async with _pc_lock:
+        out = await _fetch_full_mode(mode)
+        _pc[mode] = (time.time(), out)
+        return out
+
+
+def _schedule_refresh(mode: str) -> None:
+    """后台刷新（不阻塞当前请求）。"""
+    if mode in _pc_busy:
+        return
+    _pc_busy.add(mode)
+
+    async def run() -> None:
+        try:
+            await _refresh_mode(mode)
+            log.info("歌单 %s 后台刷新完成（%d 首）", mode, len(_pc[mode][1]))
+        except Exception as e:                               # noqa: BLE001
+            log.warning("歌单 %s 后台刷新失败（继续用旧数据）: %s", mode, e)
+        finally:
+            _pc_busy.discard(mode)
+
+    asyncio.create_task(run())
 
 
 async def warm_playlists() -> None:
-    """后台预热整份歌单。实测「收藏」913 首要翻 10 页 ≈ 15 秒，
-    用户点开时如果现翻会以为卡死；所以启动后和每 5 分钟在后台先拉好（缓存 30 分钟）。"""
+    """启动时/定时预热：**强制**重新翻页（否则缓存命中就永远不刷新了）。"""
     for mode in PAGED_MODES:
+        if mode in _pc_busy:
+            continue
+        _pc_busy.add(mode)
         try:
-            n = len(await _full_mode_songs(mode))
-            log.info("预热歌单 %s 完成（%d 首）", mode, n)
+            out = await _refresh_mode(mode)
+            log.info("预热歌单 %s 完成（%d 首）", mode, len(out))
         except Exception as e:                               # noqa: BLE001
             log.warning("预热歌单 %s 失败: %s", mode, e)
-        await asyncio.sleep(1.0)     # 别把上游一次打太狠
+        finally:
+            _pc_busy.discard(mode)
+        await asyncio.sleep(1.0)         # 别把上游一次打太狠
 
 
 async def _full_mode_songs(mode: str) -> list[dict[str, Any]]:
-    """按模式取【整份】歌单（自动翻页 + 去重 + 10 分钟缓存）。
+    """按模式取【整份】歌单。
 
-    · fav / daily / million / newrec：真能翻页，一直翻到不足一页
-    · guess / radar：上游每次随机给一小批，翻页没有意义 → 只取一批
+    策略是 **stale-while-revalidate**：缓存过期后**先返回旧数据**（毫秒级），
+    同时后台翻页刷新。之前是过期就同步翻页，用户每隔 30 分钟点开收藏都要等 15 秒。
     """
-    now = time.time()
     hit = _pc.get(mode)
-    if hit and now - hit[0] < _PLAYLIST_TTL:
+    now = time.time()
+    if hit is not None:
+        if now - hit[0] > _PLAYLIST_TTL:
+            _schedule_refresh(mode)
+            log.info("歌单 %s 缓存已过期，先返回旧数据并在后台刷新", mode)
         return hit[1]
-
-    async with _pc_lock:                      # 避免客户端并发请求时把上游打爆
-        hit = _pc.get(mode)
-        if hit and time.time() - hit[0] < _PLAYLIST_TTL:
-            return hit[1]
-
-        items: list[dict[str, Any]] = []
-        seen: set[str] = set()
-        pages = 20 if mode in _PLAYLIST_KINDS_PAGED else 1
-        for page in range(1, pages + 1):
-            r = await core.list_by_mode(mode=mode, limit=_PLAYLIST_PAGE, page=page)
-            batch = r.get("items") or []
-            added = 0
-            for it in batch:
-                sid = it.get("id") or ""
-                if not sid or sid in seen:
-                    continue
-                seen.add(sid)
-                items.append(it)
-                added += 1
-                if len(items) >= _PLAYLIST_MAX:
-                    break
-            log.info("整份歌单 %s: page=%d 取到 %d 首，新增 %d，累计 %d",
-                     mode, page, len(batch), added, len(items))
-            if len(items) >= _PLAYLIST_MAX:
-                break
-            if len(batch) < _PLAYLIST_PAGE:   # 不足一页 = 到头了
-                break
-            if added == 0:                    # 翻页没带来新歌（随机模式）→ 停
-                break
-        out = _songs(items, starred=(mode == "fav"))
-        _pc[mode] = (time.time(), out)
-        return out
+    # 冷启动（还没预热完）：只能同步取
+    _pc_busy.add(mode)
+    try:
+        return await _refresh_mode(mode)
+    finally:
+        _pc_busy.discard(mode)
 
 
 async def _one_song(mid: str) -> dict[str, Any]:

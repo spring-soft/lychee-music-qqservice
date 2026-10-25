@@ -156,29 +156,58 @@ async function openPlaylist(id, name) {
 
 /* ---------------------------------------------------------------- 列表 */
 
+const CHUNK = 120;   // 每次只渲染这么多行（收藏有 913 首，一次全渲染手机会卡）
+
+function makeRow(s, i, withBadge) {
+  const row = document.createElement('button');
+  row.className = 'row';
+  row.dataset.idx = String(i);
+  row.innerHTML =
+    '<span class="r-idx"></span>' +
+    '<span class="r-main"><div class="r-title"></div><div class="r-artist"></div></span>' +
+    '<span class="r-meta">' + (withBadge ? '<span class="badge"></span>' : '') +
+    '<span class="r-dur"></span></span>';
+  row.querySelector('.r-idx').textContent = String(i + 1);
+  row.querySelector('.r-title').textContent = s.title || '(无题)';
+  row.querySelector('.r-artist').textContent = s.artist || '';
+  if (withBadge) row.querySelector('.badge').textContent = (s.suffix || '').toUpperCase();
+  row.querySelector('.r-dur').textContent = fmtTime(s.duration);
+  row.addEventListener('click', () => {
+    if (state.index === i && !au.paused) { au.pause(); return; }
+    playAt(i);
+  });
+  return row;
+}
+
 function renderList(box, songs) {
   box.innerHTML = '';
-  if (!songs || !songs.length) { box.innerHTML = '<div class="empty">空</div>'; return; }
-  songs.forEach((s, i) => {
-    const row = document.createElement('button');
-    row.className = 'row';
-    row.dataset.idx = String(i);
-    row.innerHTML =
-      '<span class="r-idx"></span>' +
-      '<span class="r-main"><div class="r-title"></div><div class="r-artist"></div></span>' +
-      '<span class="r-meta"><span class="badge"></span><span class="r-dur"></span></span>';
-    row.querySelector('.r-idx').textContent = String(i + 1);
-    row.querySelector('.r-title').textContent = s.title || '(无题)';
-    row.querySelector('.r-artist').textContent = s.artist || '';
-    row.querySelector('.badge').textContent = (s.suffix || '').toUpperCase();
-    row.querySelector('.r-dur').textContent = fmtTime(s.duration);
-    row.addEventListener('click', () => {
-      if (state.index === i && !au.paused) { au.pause(); return; }
-      playAt(i);
-    });
-    box.appendChild(row);
-  });
+  box._songs = songs || [];
+  box._shown = 0;
+  if (!box._songs.length) { box.innerHTML = '<div class="empty">空</div>'; return; }
+  appendChunk(box);
 }
+
+function appendChunk(box) {
+  const songs = box._songs || [];
+  const shown = box._shown || 0;
+  if (shown >= songs.length) return;
+  const end = Math.min(songs.length, shown + CHUNK);
+  const frag = document.createDocumentFragment();
+  for (let i = shown; i < end; i++) frag.appendChild(makeRow(songs[i], i, true));
+  box.appendChild(frag);
+  box._shown = end;
+  markPlaying();
+}
+
+function maybeAppendOnScroll() {
+  const box = state.tab === 'search' ? $('#search-results')
+    : (state.tab === 'songs' ? $('#songs') : null);
+  if (!box || !box._songs) return;
+  if (window.innerHeight + window.scrollY >= document.documentElement.scrollHeight - 600) {
+    appendChunk(box);
+  }
+}
+window.addEventListener('scroll', maybeAppendOnScroll, { passive: true });
 
 function markPlaying() {
   ['#songs', '#search-results', '#queue-list'].forEach((sel) => {
@@ -356,24 +385,32 @@ $('#seek').addEventListener('input', () => {
 function renderQueue() {
   const box = $('#queue-list');
   box.innerHTML = '';
-  if (!state.queue.length) { box.innerHTML = '<div class="empty">队列是空的</div>'; return; }
-  state.queue.forEach((s, i) => {
-    const row = document.createElement('button');
-    row.className = 'row';
-    row.dataset.idx = String(i);
-    row.innerHTML = '<span class="r-idx"></span><span class="r-main">' +
-      '<div class="r-title"></div><div class="r-artist"></div></span>' +
-      '<span class="r-meta"><span class="r-dur"></span></span>';
-    row.querySelector('.r-idx').textContent = String(i + 1);
-    row.querySelector('.r-title').textContent = s.title || '';
-    row.querySelector('.r-artist').textContent = s.artist || '';
-    row.querySelector('.r-dur').textContent = fmtTime(s.duration);
-    row.addEventListener('click', () => { playAt(i); });
-    box.appendChild(row);
-  });
-  markPlaying();
+  box._songs = state.queue;
+  box._shown = 0;
   $('#queue-title').textContent = '播放队列（' + state.queue.length + ' 首）';
+  if (!state.queue.length) { box.innerHTML = '<div class="empty">队列是空的</div>'; return; }
+  appendQueueChunk(box);
 }
+
+function appendQueueChunk(box) {
+  const songs = box._songs || [];
+  const shown = box._shown || 0;
+  if (shown >= songs.length) return;
+  const end = Math.min(songs.length, shown + CHUNK);
+  const frag = document.createDocumentFragment();
+  for (let i = shown; i < end; i++) {
+    // makeRow 自带的点击逻辑就是 playAt(i)/(暂停同一首)，这里不要再加一遍
+    frag.appendChild(makeRow(songs[i], i, false));
+  }
+  box.appendChild(frag);
+  box._shown = end;
+  markPlaying();
+}
+
+$('#queue-list').addEventListener('scroll', () => {
+  const box = $('#queue-list');
+  if (box.scrollTop + box.clientHeight >= box.scrollHeight - 200) appendQueueChunk(box);
+}, { passive: true });
 
 $('#btn-queue').addEventListener('click', () => {
   const q = $('#queue');
