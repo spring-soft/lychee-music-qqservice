@@ -23,7 +23,9 @@ import base64
 import hashlib
 import hmac
 import inspect
+import json
 import logging
+import os
 import time
 from typing import Any, Callable
 
@@ -326,6 +328,135 @@ async def _cover_bytes(mid: str, size: int) -> tuple[bytes, str]:
     return r.content, ctype
 
 
+# ------------------------------------------------------------------ 客户端自建歌单
+#
+# 实测（2026-10-25，CloudPureMusic）：客户端会自己在服务端建歌单，id 形如
+# cloudpureplay_heartlist（存它的"红心列表"）。以前 createPlaylist 走"未实现→空结果"，
+# 但 getPlaylist 报 70，客户端就反复重试/报错。这里做一个**极小**的服务端歌单存储：
+#   data/playlists.json  {id: {id, name, created, changed, items:[item…]}}
+# 只存歌的元数据（与 /v1/list 同形状），播放时仍按 songmid 现取直链。
+_pl_lock = asyncio.Lock()
+_pl_cache: dict[str, Any] | None = None
+_PL_MAX_SONGS = 1000
+
+
+def _pl_path():
+    return core.DATA_DIR / "playlists.json"
+
+
+def _pl_load() -> dict[str, Any]:
+    global _pl_cache
+    if _pl_cache is None:
+        try:
+            raw = json.loads(_pl_path().read_text("utf-8"))
+            _pl_cache = raw if isinstance(raw, dict) else {}
+        except Exception:                                    # noqa: BLE001
+            _pl_cache = {}
+    return _pl_cache
+
+
+def _pl_save() -> None:
+    path = _pl_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(_pl_cache or {}, ensure_ascii=False), "utf-8")
+    try:
+        os.chmod(tmp, 0o600)
+    except OSError:
+        pass
+    tmp.replace(path)
+
+
+def _ids_of(v: Any) -> list[str]:
+    if v is None:
+        return []
+    if isinstance(v, list):
+        return [str(x) for x in v if x]
+    return [str(v)]
+
+
+async def _resolve_items(ids: list[str]) -> list[dict[str, Any]]:
+    """songId → 内部 item（并发 8，上限 1000 首，别让客户端超大列表把上游打爆）"""
+    ids = ids[:_PL_MAX_SONGS]
+    sem = asyncio.Semaphore(8)
+
+    async def one(sid: str):
+        async with sem:
+            try:
+                song = await core.fetch_song(sid)
+                return core.song_to_item(song)
+            except Exception:                                # noqa: BLE001
+                return None
+    got = await asyncio.gather(*[one(i) for i in ids])
+    return [x for x in got if x]
+
+
+def _pl_json(rec: dict[str, Any]) -> dict[str, Any]:
+    entries = _songs(rec.get("items") or [])
+    return {"id": rec.get("id"), "name": rec.get("name") or "",
+            "owner": next(iter(_users), ""), "public": False,
+            "songCount": len(entries), "created": _iso(rec.get("created") or 0),
+            "changed": _iso(rec.get("changed") or 0), "entry": entries}
+
+
+async def h_create_playlist(p: dict[str, Any]) -> dict[str, Any]:
+    pid = str(p.get("playlistId") or "").strip()
+    name = str(p.get("name") or "").strip()
+    items = await _resolve_items(_ids_of(p.get("songId")))
+    async with _pl_lock:
+        pls = _pl_load()
+        now = time.time()
+        if not pid:
+            pid = "qwp%d" % int(now * 1000)
+            name = name or "我的歌单"
+        rec = pls.get(pid) or {"id": pid, "name": name or "我的歌单", "created": now}
+        if name:
+            rec["name"] = name
+        rec["items"] = items
+        rec["changed"] = now
+        pls[pid] = rec
+        _pl_save()
+    log.warning("createPlaylist id=%s name=%s songs=%d", pid, rec["name"], len(items))
+    return {"playlist": _pl_json(rec)}
+
+
+async def h_update_playlist(p: dict[str, Any]) -> dict[str, Any]:
+    pid = str(p.get("playlistId") or p.get("id") or "")
+    add_items = await _resolve_items(_ids_of(p.get("songIdToAdd")))
+    async with _pl_lock:
+        pls = _pl_load()
+        rec = pls.get(pid)
+        if rec is None:
+            raise SubError(70, f"没有这个歌单: {pid}")
+        if p.get("name"):
+            rec["name"] = str(p["name"])
+        if add_items:
+            have = {it.get("id") for it in rec.get("items") or []}
+            rec.setdefault("items", []).extend(
+                [it for it in add_items if it.get("id") and it.get("id") not in have])
+        for x in _ids_of(p.get("songIndexToRemove")):
+            try:
+                i = int(x)
+            except ValueError:
+                continue
+            if 0 <= i < len(rec.get("items") or []):
+                rec["items"].pop(i)
+        rec["changed"] = time.time()
+        _pl_save()
+    log.warning("updatePlaylist id=%s -> %d 首", pid, len(rec.get("items") or []))
+    return {}
+
+
+async def h_delete_playlist(p: dict[str, Any]) -> dict[str, Any]:
+    pid = str(p.get("id") or "")
+    async with _pl_lock:
+        pls = _pl_load()
+        pls.pop(pid, None)
+        _pl_save()
+    log.warning("deletePlaylist id=%s", pid)
+    return {}
+
+
 # ------------------------------------------------------------------ 各端点
 
 def h_ping(p: dict[str, str]) -> dict[str, Any]:
@@ -390,7 +521,8 @@ def h_get_album_list2(p: dict[str, str]) -> dict[str, Any]:
 async def h_search(p: dict[str, str]) -> dict[str, Any]:
     q = p.get("query") or ""
     if not q:
-        raise SubError(10, "缺少 query 参数")
+        # 有些客户端会先发不带 query 的 search（拿空结果/历史），不该报错
+        return {"searchResult3": {"song": []}}
     try:
         limit = int(p.get("songCount") or 20)
     except ValueError:
@@ -421,23 +553,44 @@ async def h_get_random(p: dict[str, str]) -> dict[str, Any]:
     return {"randomSongs": {"song": await _mode_songs("guess", size)}}
 
 
-async def h_get_playlists(p: dict[str, str]) -> dict[str, Any]:
-    """6 个 QQ 模式 → 6 个 Subsonic 歌单（id 就是 mode 名，稳定不变）。"""
-    items = [{"id": m["mode"], "name": m["name"], "owner": next(iter(_users), ""),
-              "public": False, "created": _iso(0), "changed": _iso(0)} for m in core.MODES]
+async def h_get_playlists(p: dict[str, Any]) -> dict[str, Any]:
+    """6 个 QQ 模式 → 6 个 Subsonic 歌单（id 就是 mode 名，稳定不变）。
+
+    再加上客户端自己建的服务端歌单（data/playlists.json）。
+    """
+    owner = next(iter(_users), "")
+    items: list[dict[str, Any]] = [
+        {"id": m["mode"], "name": m["name"], "owner": owner,
+         "public": False, "songCount": 0, "created": _iso(0), "changed": _iso(0)}
+        for m in core.MODES
+    ]
+    for pid, rec in _pl_load().items():
+        items.append({"id": pid, "name": rec.get("name") or pid, "owner": owner,
+                      "public": False, "songCount": len(rec.get("items") or []),
+                      "created": _iso(rec.get("created") or 0),
+                      "changed": _iso(rec.get("changed") or 0)})
     return {"playlists": {"playlist": items}}
 
 
-async def h_get_playlist(p: dict[str, str]) -> dict[str, Any]:
+async def h_get_playlist(p: dict[str, Any]) -> dict[str, Any]:
     pid = p.get("id") or ""
+    owner = next(iter(_users), "")
     known = {m["mode"] for m in core.MODES}
-    if pid not in known:
-        raise SubError(70, f"没有这个歌单: {pid}")
-    entries = await _full_mode_songs(pid)
-    label = next(m["name"] for m in core.MODES if m["mode"] == pid)
-    return {"playlist": {"id": pid, "name": label, "owner": next(iter(_users), ""),
-                         "public": False, "songCount": len(entries),
-                         "created": _iso(0), "changed": _iso(0), "entry": entries}}
+    if pid in known:
+        entries = await _full_mode_songs(pid)
+        label = next(m["name"] for m in core.MODES if m["mode"] == pid)
+        return {"playlist": {"id": pid, "name": label, "owner": owner,
+                             "public": False, "songCount": len(entries),
+                             "created": _iso(0), "changed": _iso(0), "entry": entries}}
+    rec = _pl_load().get(pid)
+    if rec is not None:
+        return {"playlist": _pl_json(rec)}
+    # 客户端引用了不存在的歌单（典型：它自己还没同步成功的 cloudpureplay_xxx）：
+    # 返回空歌单而不是错误码 —— 报 70 会让某些客户端一直重试并弹错误。
+    log.info("getPlaylist: 未知歌单 %s，返回空歌单", pid)
+    return {"playlist": {"id": pid, "name": pid, "owner": owner, "public": False,
+                         "songCount": 0, "created": _iso(0), "changed": _iso(0),
+                         "entry": []}}
 
 
 def _force_https(url: str) -> str:
@@ -486,7 +639,7 @@ def _want_quality(p: dict[str, str]) -> str | None:
 async def h_cover(p: dict[str, str]) -> Response:
     mid = p.get("id") or ""
     if not mid or mid == "none":
-        raise SubError(70, "没有封面")
+        return Response(status_code=204)
     try:
         size = int(p.get("size") or 300)
     except ValueError:
@@ -601,6 +754,9 @@ _HANDLERS: dict[str, Callable[[dict[str, str]], Any]] = {
     "getRandomSongs": h_get_random,
     "getPlaylists": h_get_playlists,
     "getPlaylist": h_get_playlist,
+    "createPlaylist": h_create_playlist,
+    "updatePlaylist": h_update_playlist,
+    "deletePlaylist": h_delete_playlist,
     "stream": h_stream,
     "download": h_stream,
     "getCoverArt": h_cover,
@@ -617,12 +773,21 @@ _HANDLERS: dict[str, Callable[[dict[str, str]], Any]] = {
 }
 
 
-async def _params(request: Request) -> dict[str, str]:
-    p = {k: v for k, v in request.query_params.items()}
+async def _params(request: Request) -> dict[str, Any]:
+    """取参数。同名参数（客户端会重复传 songId=…&songId=…）收成 list。"""
+    p: dict[str, Any] = {}
+    for k, v in request.query_params.multi_items():
+        if k in p:
+            if isinstance(p[k], list):
+                p[k].append(v)
+            else:
+                p[k] = [p[k], v]
+        else:
+            p[k] = v
     if request.method == "POST":
         try:
             form = await request.form()
-            for k, v in form.items():
+            for k, v in form.multi_items():
                 if k not in p:
                     p[str(k)] = str(v)
         except Exception:                                    # noqa: BLE001
@@ -639,6 +804,20 @@ async def _handle(request: Request, method: str) -> Response:
     p = await _params(request)
     try:
         _auth(request, p)
+
+        # ★ 每个请求一行（不含封面/头像这种高频请求）：排查"客户端到底连到哪、发了什么"
+        #   时这是第一手证据（客户端名 c=…、UA、参数）。
+        if method not in ("getCoverArt", "getAvatar"):
+            ip = (request.headers.get("x-forwarded-for") or "").split(",")[0].strip() \
+                or (request.client.host if request.client else "-")
+            log.info("REQ %-20s c=%-16s u=%-10s ip=%-15s args=%s ua=%r",
+                     method, str(p.get("c") or "-")[:16], str(p.get("u") or "-")[:10], ip,
+                     json.dumps({k: v for k, v in p.items()
+                                 if k in ("id", "query", "songCount", "size", "username",
+                                          "playlistId", "format", "maxBitRate")},
+                                ensure_ascii=False)[:180],
+                     request.headers.get("user-agent"))
+
         fn = _HANDLERS.get(method)
         if fn is None:
             log.info("未实现的端点（返回空结果）: %s %s", method, _sanitize(p))
