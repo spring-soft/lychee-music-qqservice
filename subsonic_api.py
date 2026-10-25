@@ -18,7 +18,10 @@
 """
 from __future__ import annotations
 
+import asyncio
+import base64
 import hashlib
+import hmac
 import inspect
 import logging
 import time
@@ -84,28 +87,56 @@ def _failed(code: int, message: str) -> JSONResponse:
 # ------------------------------------------------------------------ 鉴权
 
 def _auth(request: Request, params: dict[str, str]) -> str:
-    """校验身份：网页会话 cookie **或** Subsonic 的 u/t/s、u/p。失败抛 SubError(40)。"""
+    """校验身份。按客户端实际会用的四套方式依次尝试（都是 Subsonic 生态里真实存在的）：
+
+      1) 网页会话 cookie（自己的页面用）
+      2) HTTP Basic: Authorization: Basic base64(user:pass)  ← 有的客户端走这条
+      3) u + t + s：t = md5(password + salt)              ← 标准 token 认证
+      4) u + p：明文，或 p=enc:<六进制>                     ← 老客户端 / HTTP 下的写法
+
+    失败统一抛 SubError(40)（Subsonic 约定：鉴权失败也返回 HTTP 200）。
+    """
     cookie_user = websession.user_from_request(request)
     if cookie_user:
         return cookie_user
 
-    u = params.get("u") or ""
-    t = (params.get("t") or "").lower()
-    s = params.get("s") or ""
-    p = params.get("p")
+    # 2) HTTP Basic
+    authz = request.headers.get("authorization") or ""
+    if authz.lower().startswith("basic "):
+        try:
+            raw = base64.b64decode(authz.split(None, 1)[1].strip()).decode("utf-8", "replace")
+            bu, _, bpw = raw.partition(":")
+            if websession.verify_password(bu, bpw):
+                return bu
+        except Exception:                                    # noqa: BLE001
+            pass
 
+    u = params.get("u") or ""
     pw = _users.get(u)
     if pw is None:
         raise SubError(40, "Wrong username or password")
+
+    # 3) token
+    t = (params.get("t") or "").lower()
+    s = params.get("s") or ""
     if t and s:
-        if hashlib.md5((pw + s).encode("utf-8")).hexdigest().lower() != t:
-            raise SubError(40, "Wrong username or password")
-        return u
-    if p is not None:
-        # 客户端可能用 enc: 前缀；不支持就先按明文比
-        if p == pw:
+        if hashlib.md5((pw + s).encode("utf-8")).hexdigest().lower() == t:
             return u
         raise SubError(40, "Wrong username or password")
+
+    # 4) 明文 / enc:<hex>
+    p = params.get("p")
+    if p is not None:
+        cand = p
+        if cand.startswith("enc:"):
+            try:
+                cand = bytes.fromhex(cand[4:]).decode("utf-8", "replace")
+            except ValueError:
+                cand = ""
+        if hmac.compare_digest(cand.encode("utf-8"), pw.encode("utf-8")):
+            return u
+        raise SubError(40, "Wrong username or password")
+
     raise SubError(40, "Missing authentication token")
 
 
@@ -177,9 +208,78 @@ async def _mode_songs(mode: str, limit: int, page: int = 1) -> list[dict[str, An
     return _songs(r.get("items") or [], starred=(mode == "fav"))
 
 
-async def _fav_songs(limit: int) -> list[dict[str, Any]]:
-    r = await core.favorites(limit=limit, page=1)
-    return _songs(r.get("items") or [], starred=True)
+# ------------------------------------------------------------------ 完整歌单
+
+# 可翻页的模式（启动后后台预热这几个，避免用户点开时等十几秒）
+PAGED_MODES = ("fav", "daily", "million", "newrec")
+
+# ★ Subsonic 的 getPlaylist 没有分页参数：客户端期望一次拿到整份歌单。
+#   而 /v1/list 单页上限 100 首（上游 query_song 一次最多 100 个 mid），
+#   所以这里要自己翻页。实测「收藏」有 900+ 首，只取第一页客户端就永远停在 100。
+_PLAYLIST_TTL = 1800.0       # 整份歌单缓存 30 分钟（翻页要 10+ 次上游请求，别每次都打）
+_PLAYLIST_MAX = 2000         # 上限，防止某个模式无限翻页
+_PLAYLIST_PAGE = 100         # /v1/list 单页上限
+_PLAYLIST_KINDS_PAGED = {"fav", "daily", "million", "newrec"}   # 能真翻页的模式
+
+_pc: dict[str, tuple[float, list[dict[str, Any]]]] = {}
+_pc_lock = asyncio.Lock()
+
+
+async def warm_playlists() -> None:
+    """后台预热整份歌单。实测「收藏」913 首要翻 10 页 ≈ 15 秒，
+    用户点开时如果现翻会以为卡死；所以启动后和每 5 分钟在后台先拉好（缓存 30 分钟）。"""
+    for mode in PAGED_MODES:
+        try:
+            n = len(await _full_mode_songs(mode))
+            log.info("预热歌单 %s 完成（%d 首）", mode, n)
+        except Exception as e:                               # noqa: BLE001
+            log.warning("预热歌单 %s 失败: %s", mode, e)
+        await asyncio.sleep(1.0)     # 别把上游一次打太狠
+
+
+async def _full_mode_songs(mode: str) -> list[dict[str, Any]]:
+    """按模式取【整份】歌单（自动翻页 + 去重 + 10 分钟缓存）。
+
+    · fav / daily / million / newrec：真能翻页，一直翻到不足一页
+    · guess / radar：上游每次随机给一小批，翻页没有意义 → 只取一批
+    """
+    now = time.time()
+    hit = _pc.get(mode)
+    if hit and now - hit[0] < _PLAYLIST_TTL:
+        return hit[1]
+
+    async with _pc_lock:                      # 避免客户端并发请求时把上游打爆
+        hit = _pc.get(mode)
+        if hit and time.time() - hit[0] < _PLAYLIST_TTL:
+            return hit[1]
+
+        items: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        pages = 20 if mode in _PLAYLIST_KINDS_PAGED else 1
+        for page in range(1, pages + 1):
+            r = await core.list_by_mode(mode=mode, limit=_PLAYLIST_PAGE, page=page)
+            batch = r.get("items") or []
+            added = 0
+            for it in batch:
+                sid = it.get("id") or ""
+                if not sid or sid in seen:
+                    continue
+                seen.add(sid)
+                items.append(it)
+                added += 1
+                if len(items) >= _PLAYLIST_MAX:
+                    break
+            log.info("整份歌单 %s: page=%d 取到 %d 首，新增 %d，累计 %d",
+                     mode, page, len(batch), added, len(items))
+            if len(items) >= _PLAYLIST_MAX:
+                break
+            if len(batch) < _PLAYLIST_PAGE:   # 不足一页 = 到头了
+                break
+            if added == 0:                    # 翻页没带来新歌（随机模式）→ 停
+                break
+        out = _songs(items, starred=(mode == "fav"))
+        _pc[mode] = (time.time(), out)
+        return out
 
 
 async def _one_song(mid: str) -> dict[str, Any]:
@@ -240,6 +340,39 @@ def h_get_music_folders(p: dict[str, str]) -> dict[str, Any]:
     return {"musicFolders": {"musicFolder": [{"id": 1, "name": "QQ 音乐"}]}}
 
 
+async def h_get_user(p: dict[str, str]) -> dict[str, Any]:
+    """getUser —— 登录后很多客户端第一件事就是它。
+
+    ★ 实测踩过（2026-10-25）：CloudPureMusic 在 token 认证通过之后调 getUser，
+      当时这里走"未实现 → status=ok 的空对象"，客户端就判定**用户名或密码错误**。
+      所以它必须返回真实的 user 对象，不能空。
+    """
+    wanted = p.get("username") or p.get("u") or ""
+    if wanted not in _users:
+        raise SubError(70, f"没有这个用户: {wanted}")
+    return {"user": {
+        "username": wanted,
+        "email": "",
+        "scrobblingEnabled": False,
+        "adminRole": True,
+        "settingsRole": False,
+        "downloadRole": True,
+        "uploadRole": False,
+        "playlistRole": True,
+        "coverArtRole": True,
+        "commentRole": False,
+        "podcastRole": False,
+        "shareRole": False,
+        "videoConversionRole": False,
+        "musicFolderId": [1],
+    }}
+
+
+def h_get_avatar(p: dict[str, str]) -> Response:
+    # 头像：没有就 204（Subsonic 规范允许无头像）
+    return Response(status_code=204)
+
+
 def h_get_indexes(p: dict[str, str]) -> dict[str, Any]:
     return {"indexes": {"ignoredArticles": "", "index": []}}
 
@@ -275,7 +408,8 @@ async def h_get_song(p: dict[str, str]) -> dict[str, Any]:
 
 
 async def h_get_starred2(p: dict[str, str]) -> dict[str, Any]:
-    return {"starred2": {"song": await _fav_songs(100)}}
+    # 整份「我喜欢」都返回（以前只给 100 首，客户端收藏列表会永远停在 100）
+    return {"starred2": {"song": await _full_mode_songs("fav")}}
 
 
 async def h_get_random(p: dict[str, str]) -> dict[str, Any]:
@@ -299,7 +433,7 @@ async def h_get_playlist(p: dict[str, str]) -> dict[str, Any]:
     known = {m["mode"] for m in core.MODES}
     if pid not in known:
         raise SubError(70, f"没有这个歌单: {pid}")
-    entries = await _mode_songs(pid, 100, 1)
+    entries = await _full_mode_songs(pid)
     label = next(m["name"] for m in core.MODES if m["mode"] == pid)
     return {"playlist": {"id": pid, "name": label, "owner": next(iter(_users), ""),
                          "public": False, "songCount": len(entries),
@@ -450,6 +584,8 @@ _HANDLERS: dict[str, Callable[[dict[str, str]], Any]] = {
     "ping": h_ping,
     "getLicense": h_get_license,
     "getMusicFolders": h_get_music_folders,
+    "getUser": h_get_user,
+    "getAvatar": h_get_avatar,
     "getIndexes": h_get_indexes,
     "getArtists": h_get_artists,
     "getArtist": h_empty_list,
@@ -516,6 +652,14 @@ async def _handle(request: Request, method: str) -> Response:
             payload = {}
         return _ok(payload)
     except SubError as e:
+        if e.code in (40, 41, 42, 43):
+            # ★ 鉴权失败的诊断日志：**不记密码/令牌**，只记"客户端用了哪种方式、账号是什么"。
+            #   真实客户端五花八门（token / enc: / Basic / 空密码），没这条日志只能瞎猜。
+            log.warning("鉴权失败 %s: u=%r t=%s s=%s p=%r basic=%s cookie=%s ua=%r query=%s",
+                        method, p.get("u"), bool(p.get("t")), bool(p.get("s")),
+                        (p.get("p") or "")[:4], bool(request.headers.get("authorization")),
+                        websession.COOKIE in request.cookies,
+                        request.headers.get("user-agent"), _sanitize(p))
         log.warning("%s 失败: code=%s %s", method, e.code, e.message)
         return _failed(e.code, e.message)
     except Exception as e:                                   # noqa: BLE001

@@ -94,6 +94,17 @@ async def _watch_cred() -> None:
                 log.warning("重载凭据失败: %s", e)
 
 
+async def _warm_loop() -> None:
+    """启动后在后台把整份歌单（收藏 900+ 首要翻 10 页）先拉进缓存。"""
+    await asyncio.sleep(5)
+    while True:
+        try:
+            await subsonic_api.warm_playlists()
+        except Exception as e:                              # noqa: BLE001
+            log.warning("歌单预热失败: %s", e)
+        await asyncio.sleep(300)
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     conf = load_web_conf()
@@ -107,9 +118,11 @@ async def lifespan(_: FastAPI):
     _state["cred_mtime"] = _cred_mtime()
     log.warning("启动：端口 3211，网页用户=%s，QQ 凭据=%s", user, core.cred_state())
     task = asyncio.create_task(_watch_cred())
+    warm = asyncio.create_task(_warm_loop())
     try:
         yield
     finally:
+        warm.cancel()
         task.cancel()
         try:
             await cli.close()
