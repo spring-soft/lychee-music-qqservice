@@ -255,3 +255,22 @@ async def healthz() -> JSONResponse:
                          "cred": core.cred_state(),
                          "guard": guard.stats(),
                          "endpoints": ["/rest/ping.view", "/rest/search3.view"]})
+
+
+# ⚠️ 兜底路由必须放在**所有具体路由之后**（FastAPI 按注册顺序匹配，放前面会把 /healthz
+#    之类全吃掉）。2026-10-25 踩过：放前面导致 /healthz 变成 404。
+@app.api_route("/{path:path}", methods=["GET", "POST", "HEAD", "OPTIONS"])
+async def _fallback(request: Request, path: str) -> Response:
+    """未知路径：记一条日志（排查客户端路径填错），并给 Subsonic 风格的明确报错。"""
+    full = request.url.path
+    log.warning("404 未知路径: %s %s ua=%r ip=%s 完整URL=%s",
+                request.method, full, request.headers.get("user-agent"),
+                guard.client_ip(request), str(request.url)[:200])
+    if full.startswith("/rest"):
+        return JSONResponse({"subsonic-response": {
+            "status": "failed", "version": "1.16.1",
+            "error": {"code": 0, "message": "未知端点: " + full},
+        }})
+    return JSONResponse({"ok": False, "error": "未知路径: " + full,
+                         "hint": "Subsonic 客户端请把服务器地址填成 http://<服务器IP>:3211（不要带 /rest、不要带路径）"},
+                        status_code=404)

@@ -131,7 +131,8 @@ systemctl list-timers credrefresh.timer
    依赖 timeOffset 的会从头放（QQ 直链没有时间轴 seek）。
 3. **收藏/歌单整份返回是翻页拼的**：fav 913 首第一次要约 15 秒，之后缓存 30 分钟，
    启动后后台预热；过期后先返回旧数据再后台刷新（stale-while-revalidate）。
-4. **只返回 JSON**（f=xml 不实现）；单账号；无播放次数/跨设备续播。
+4. **响应格式**：f=json → JSON；f 缺省 / f=xml → XML（Subsonic 规范默认 XML，
+   2026-10-25 补，音流 Musiver 就是不带 f 的客户端）；单账号；无播放次数/跨设备续播。
 5. **专辑列表只有「新碟上架」**（newest/recent/random），没有按流派/年代筛选。
 
 ## 调试

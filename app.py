@@ -43,7 +43,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 
 from qqmusic_api import Client, Credential
@@ -1010,6 +1010,20 @@ async def _qq_lyric(mid: str) -> str:
     """mid -> LRC 纯文本（下载时存成同名 .lrc 旁路文件）。"""
     r = await lyric(id=mid)
     return r if isinstance(r, str) else ""
+
+
+# ---------------- 未知路径兜底（排查客户端连错端口）----------------
+# 3210 是 ESP 契约层（/v1/*），不是 Subsonic。客户端错连到 3210 时这里会记日志。
+
+@app.api_route("/{path:path}", methods=["GET", "POST", "HEAD", "OPTIONS"])
+async def _fallback(request: Request, path: str) -> JSONResponse:
+    full = request.url.path
+    if full.startswith("/rest"):
+        log.warning("Subsonic 请求打到 3210（ESP 契约层，连错端口）: %s ua=%r",
+                    full, request.headers.get("user-agent"))
+    return JSONResponse({"error": "未知路径: " + full,
+                         "hint": "Subsonic /rest 在 3211；这里 3210 只有 /v1/*（ESP 专用）"},
+                        status_code=404)
 
 
 

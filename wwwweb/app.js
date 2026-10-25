@@ -38,7 +38,9 @@ function fmtTime(sec) {
 }
 
 async function api(name, params) {
-  const qs = new URLSearchParams(params || {}).toString();
+  // ★ 必须显式带 f=json：服务端按 Subsonic 规范把“缺省 f”当成 XML 返回，
+  //   不带的话网页这边会拿到 XML 解析失败（2026-10-25 补 XML 支持时踩到）。
+  const qs = new URLSearchParams(Object.assign({ f: 'json' }, params || {})).toString();
   let r;
   try {
     r = await fetch('/rest/' + name + '.view?' + qs, { credentials: 'same-origin' });

@@ -33,6 +33,7 @@ from typing import Any, Callable
 import httpx
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, RedirectResponse, Response
+from xml.sax.saxutils import escape as _xml_escape
 
 import app as core
 import guard
@@ -87,14 +88,74 @@ def _envelope(payload: dict[str, Any] | None = None, *, status: str = "ok") -> d
     return {"subsonic-response": r}
 
 
-def _ok(payload: dict[str, Any] | None = None) -> JSONResponse:
-    return JSONResponse(_envelope(payload))
+# ------------------------------------------------------------------ XML 输出
+#
+# ★ 2026-10-25 踩过：音流（Musiver）不带 f=json，按 Subsonic 规范默认就是 **XML**，
+#   我们之前只回 JSON → 它报 "Response parse error"（连 ping 都解析不了）。
+#   规范：f 缺省 = xml，f=json 才是 JSON。所以这里按请求的 f 选择输出格式。
+
+def _xml_attr(v: Any) -> str:
+    s = "true" if v is True else "false" if v is False else str(v)
+    return _xml_escape(s, {'"': "&quot;", "\n": "&#10;", "\r": "&#13;", "\t": "&#9;"})
 
 
-def _failed(code: int, message: str) -> JSONResponse:
+def _xml_node(name: str, val: Any) -> str:
+    """把 dict/list/标量转成 Subsonic 风格的 XML 元素。
+
+    规则（跟 Subsonic 的 XML 形状一致）：
+      · dict  → <name 标量字段当属性> 嵌套 dict/list 当子元素 </name>
+      · list  → 每个元素展开成同名元素（键名本身就是单数，如 song / playlist / album）
+      · 标量  → <name>值</name>（当前用不到，留着兜底）
+    """
+    if isinstance(val, dict):
+        attrs: list[str] = []
+        children: list[str] = []
+        for k, v in val.items():
+            if v is None:
+                continue
+            if isinstance(v, (dict, list)):
+                children.append(_xml_node(k, v))
+            else:
+                attrs.append('%s="%s"' % (k, _xml_attr(v)))
+        a = (" " + " ".join(attrs)) if attrs else ""
+        if children:
+            return "<%s%s>%s</%s>" % (name, a, "".join(children), name)
+        return "<%s%s/>" % (name, a)
+    if isinstance(val, list):
+        return "".join(_xml_node(name, item) for item in val)
+    return "<%s>%s</%s>" % (name, _xml_escape(str(val)), name)
+
+
+def _xml_response(env: dict[str, Any]) -> Response:
+    r = env["subsonic-response"]
+    attrs = []
+    children = []
+    for k, v in r.items():
+        if v is None:
+            continue
+        if isinstance(v, (dict, list)):
+            children.append(_xml_node(k, v))
+        else:
+            attrs.append('%s="%s"' % (k, _xml_attr(v)))
+    a = (" " + " ".join(attrs)) if attrs else ""
+    body = ('<?xml version="1.0" encoding="UTF-8"?>'
+            '<subsonic-response xmlns="http://subsonic.org/restapi"%s>%s</subsonic-response>'
+            % (a, "".join(children)))
+    return Response(body, media_type="application/xml; charset=utf-8")
+
+
+def _respond(env: dict[str, Any], fmt: str) -> Response:
+    return JSONResponse(env) if fmt == "json" else _xml_response(env)
+
+
+def _ok(payload: dict[str, Any] | None = None, fmt: str = "json") -> Response:
+    return _respond(_envelope(payload), fmt)
+
+
+def _failed(code: int, message: str, fmt: str = "json") -> Response:
     r = _envelope(status="failed")
     r["subsonic-response"]["error"] = {"code": code, "message": message}
-    return JSONResponse(r)
+    return _respond(r, fmt)
 
 
 # ------------------------------------------------------------------ 鉴权
@@ -1057,13 +1118,15 @@ def _sanitize(p: dict[str, str]) -> dict[str, str]:
 
 async def _handle(request: Request, method: str) -> Response:
     p = await _params(request)
+    # Subsonic 规范：f 缺省 = XML，只有 f=json 才回 JSON。
+    fmt = "json" if str(p.get("f") or "").lower() == "json" else "xml"
     ip = guard.client_ip(request)
     # ★ 防护：被封 / 超速 → Subsonic error 50（客户端会显示"太频繁"而不是密码错）
     if guard.blocked(ip):
         log.warning("已封禁 IP 仍在请求: %s %s", ip, method)
-        return _failed(50, "请求过于频繁，已被暂时封禁，请稍后再试")
+        return _failed(50, "请求过于频繁，已被暂时封禁，请稍后再试", fmt)
     if method not in ("getCoverArt", "getAvatar") and not guard.allow(ip):
-        return _failed(50, "请求过于频繁，请稍后再试")
+        return _failed(50, "请求过于频繁，请稍后再试", fmt)
     try:
         _auth(request, p)
 
@@ -1072,19 +1135,19 @@ async def _handle(request: Request, method: str) -> Response:
         if method not in ("getCoverArt", "getAvatar"):
             ip = (request.headers.get("x-forwarded-for") or "").split(",")[0].strip() \
                 or (request.client.host if request.client else "-")
-            log.info("REQ %-20s c=%-16s u=%-10s v=%-7s ip=%-15s args=%s ua=%r",
+            log.info("REQ %-20s c=%-16s u=%-10s v=%-7s f=%-4s ip=%-15s args=%s ua=%r",
                      method, str(p.get("c") or "-")[:16], str(p.get("u") or "-")[:10],
-                     str(p.get("v") or "-")[:7], ip,
+                     str(p.get("v") or "-")[:7], str(p.get("f") or "-")[:4], ip,
                      json.dumps({k: v for k, v in p.items()
                                  if k in ("id", "query", "songCount", "size", "username",
                                           "playlistId", "format", "maxBitRate")},
-                                ensure_ascii=False)[:180],
+                                ensure_ascii=False)[:160],
                      request.headers.get("user-agent"))
 
         fn = _HANDLERS.get(method)
         if fn is None:
             log.info("未实现的端点（返回空结果）: %s %s", method, _sanitize(p))
-            return _ok()
+            return _ok(fmt=fmt)
         payload = fn(p)
         if inspect.isawaitable(payload):
             payload = await payload
@@ -1092,7 +1155,7 @@ async def _handle(request: Request, method: str) -> Response:
             return payload
         if payload is None:
             payload = {}
-        return _ok(payload)
+        return _ok(payload, fmt)
     except SubError as e:
         if e.code in (40, 41, 42, 43):
             guard.note_auth_fail(ip)
@@ -1104,10 +1167,10 @@ async def _handle(request: Request, method: str) -> Response:
                         websession.COOKIE in request.cookies,
                         request.headers.get("user-agent"), _sanitize(p))
         log.warning("%s 失败: code=%s %s", method, e.code, e.message)
-        return _failed(e.code, e.message)
+        return _failed(e.code, e.message, fmt)
     except Exception as e:                                   # noqa: BLE001
         log.exception("%s 异常", method)
-        return _failed(0, f"{type(e).__name__}: {e}")
+        return _failed(0, f"{type(e).__name__}: {e}", fmt)
 
 
 
@@ -1123,4 +1186,5 @@ async def rest_bare(request: Request, method: str) -> Response:
 
 @router.api_route("", methods=["GET", "POST"])
 async def rest_root(request: Request) -> Response:
-    return _failed(0, "要调用具体端点，例如 /rest/ping.view")
+    fmt = "json" if (request.query_params.get("f") or "").lower() == "json" else "xml"
+    return _failed(0, "要调用具体端点，例如 /rest/ping.view", fmt)
