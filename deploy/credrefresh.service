@@ -1,0 +1,13 @@
+[Unit]
+Description=QQ Music credential auto-refresh (需要时续期并写回 credential.json)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=qqmusic
+Group=qqmusic
+WorkingDirectory=/opt/qqmusic
+Environment=QQ_DATA_DIR=/opt/qqmusic/data
+ExecStart=/opt/qqmusic/venv/bin/python /opt/qqmusic/credrefresh.py
+TimeoutStartSec=120

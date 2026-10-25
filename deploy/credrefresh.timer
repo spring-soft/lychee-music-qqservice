@@ -1,0 +1,11 @@
+[Unit]
+Description=QQ Music credential auto-refresh timer（每 30 分钟检查一次）
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=30min
+AccuracySec=1min
+Unit=credrefresh.service
+
+[Install]
+WantedBy=timers.target

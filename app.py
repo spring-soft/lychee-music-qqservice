@@ -281,6 +281,45 @@ async def resolve_play_url(mid: str, want: str | None) -> dict[str, Any]:
 
 # ----------------------------------------------------------------- 应用
 
+async def _cred_watch_task() -> None:
+    """每 5 分钟看一次 credential.json：
+    · 文件变了（自动续期 timer / 重新扫码写回）→ 重载；
+    · 马上要过期了（<2 小时且文件还没换）→ 自己调 refresh_credential 并写回。
+    这样 3210 这条线不会因为凭据过期突然全线报"重新扫码"。
+    """
+    mtime = 0.0
+    try:
+        mtime = CRED_PATH.stat().st_mtime
+    except OSError:
+        pass
+    while True:
+        await asyncio.sleep(300)
+        try:
+            now_mtime = CRED_PATH.stat().st_mtime
+        except OSError:
+            now_mtime = mtime
+        if now_mtime != mtime:
+            mtime = now_mtime
+            new = load_cred()
+            if new is not None:
+                set_cred(new)
+                log.warning("凭据文件已更新，已重载（expired=%s）", new.is_expired())
+            continue
+        cur = _state["cred"]
+        if cur is None or not cur.is_valid():
+            continue
+        remain = cur.musickey_create_time + cur.key_expires_in - int(time.time())
+        if remain > 2 * 3600:
+            continue
+        try:
+            refreshed = await _state["client"].login.refresh_credential()
+            save_cred(refreshed)
+            set_cred(refreshed)
+            log.warning("凭据自动续期成功（剩余 %d 秒）", refreshed.key_expires_in)
+        except Exception as e:                               # noqa: BLE001
+            log.warning("凭据自动续期失败（需要用二维码重新登录）: %s", e)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -294,9 +333,11 @@ async def lifespan(app: FastAPI):
     await player.startup(_qq_item, _qq_url, _qq_list, _qq_search, MODES)
     # 下载入库（QQ 无损 -> /mnt/usb/music/QQ下载，带封面和 UTF-8 歌词）
     await download.startup(_qq_resolve, _qq_meta, _qq_lyric)
+    cred_watch = asyncio.create_task(_cred_watch_task())
     try:
         yield
     finally:
+        cred_watch.cancel()
         await download.shutdown()
         await player.shutdown()
         await _state["client"].close()

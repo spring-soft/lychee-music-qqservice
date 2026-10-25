@@ -94,6 +94,29 @@ TLS 由 Cloudflare 终止；音频是 302 到 QQ CDN，**不经过 Cloudflare**�
 只对**失败**计数，正常播放/浏览不会被误伤；计数在内存里，重启清零。
 healthz 里的 guard 字段可看实时计数。
 
+⚠️ **内网(192.168.x/10.x) / 本机 / Tailscale(100.64.0.0/10 等) 地址不做封禁**——
+封禁只为防公网暴破。2026-10-25 踩过：不区分来源时，内网设备输错几次密码就被封，
+连已登录的播放/封面也被拦，表现为"突然登录不上、歌也放不了"；修复见 guard._trusted()。
+
+## 凭据自动续期（重要）
+
+QQ 的 musickey 只有 **3 天**有效期（key_expires_in=259200），过期后所有取流接口
+报「登录凭证已过期，重新扫码」。但上游库有 refresh_credential()（refresh_token 续期），
+所以不需要频繁扫码：
+
+- `credrefresh.timer` 每 30 分钟检查；剩余 < 2 小时就续期并写回 `data/credential.json`
+- qqweb 看文件 mtime 自动重载；qqmusic(3210) 有 5 分钟一次的 mtime/到期检查
+- 只有 **refresh_token 本身失效**（长期不续、换设备、QQ 侧踢下线）才需要重新扫码：
+  打开 http://<服务器>:3210/ 的网页控制台 → QQ 账号面板 → 扫码
+
+手动检查/续期：
+
+```bash
+cd /opt/qqmusic && ./venv/bin/python credrefresh.py          # 还够用会跳过
+./venv/bin/python credrefresh.py --force                      # 强制续期
+systemctl list-timers credrefresh.timer
+```
+
 ## 网页播放器
 
 登录（HttpOnly cookie）、歌单卡片（含曲目数）、搜索、队列抽屉、歌词同步高亮、
@@ -107,7 +130,7 @@ healthz 里的 guard 字段可看实时计数。
 2. **拖进度条不可靠**：stream 是 302，客户端用 HTTP Range 直连 CDN 的能拖；
    依赖 timeOffset 的会从头放（QQ 直链没有时间轴 seek）。
 3. **收藏/歌单整份返回是翻页拼的**：fav 913 首第一次要约 15 秒，之后缓存 30 分钟，
-   启动后后台预热。
+   启动后后台预热；过期后先返回旧数据再后台刷新（stale-while-revalidate）。
 4. **只返回 JSON**（f=xml 不实现）；单账号；无播放次数/跨设备续播。
 5. **专辑列表只有「新碟上架」**（newest/recent/random），没有按流派/年代筛选。
 

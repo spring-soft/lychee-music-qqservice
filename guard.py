@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import logging
 import time
 from collections import deque
@@ -58,7 +59,28 @@ def client_ip(request) -> str:
     return request.client.host if request.client else "-"
 
 
+def _trusted(ip: str) -> bool:
+    """内网 / 本机 / Tailscale 地址：可信区，**不做封禁**。
+
+    ★ 为什么（2026-10-25 踩过）：一开始不区分来源，内网设备输错几次密码就被封 15 分钟，
+      连已登录的播放/封面请求也一起被拦，表现为"突然登录不上、歌也放不了"。
+      封禁本来是为了防公网暴破，内网和 tailnet 都是自己的设备，不需要这套。
+    """
+    try:
+        a = ipaddress.ip_address(ip.strip())
+    except ValueError:
+        return False
+    if a.is_private or a.is_loopback or a.is_link_local:
+        return True
+    # CGNAT 段（Tailscale 100.64.0.0/10 就在这里）
+    if a.version == 4 and a in ipaddress.ip_network("100.64.0.0/10"):
+        return True
+    return False
+
+
 def blocked(ip: str) -> bool:
+    if _trusted(ip):
+        return False
     now = time.time()
     until = _b.ban_until.get(ip, 0.0)
     if until and now < until:
