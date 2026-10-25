@@ -1,0 +1,10 @@
+[Unit]
+Description=QQ Music web face socket (3211，重启服务时连接不会断)
+
+[Socket]
+ListenStream=0.0.0.0:3211
+NoDelay=true
+Backlog=128
+
+[Install]
+WantedBy=sockets.target

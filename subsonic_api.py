@@ -26,6 +26,7 @@ import inspect
 import json
 import logging
 import os
+import random
 import time
 from typing import Any, Callable
 
@@ -34,6 +35,7 @@ from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, RedirectResponse, Response
 
 import app as core
+import guard
 import websession
 
 log = logging.getLogger("qqweb.subsonic")
@@ -324,7 +326,12 @@ async def _cover_bytes(mid: str, size: int) -> tuple[bytes, str]:
     hit = _cover_cache.get(key)
     if hit and now - hit[2] < _COVER_TTL:
         return hit[0], hit[1]
-    url = core.COVER_TMPL.format(s=size, mid=mid)
+    # 歌手头像：getArtists 里用 "ar_<mid>" 当 coverArt id，这里换成 T001 模板
+    if mid.startswith("ar_"):
+        url = "http://y.qq.com/music/photo_new/T001R{s}x{s}M000{mid}.jpg".format(
+            s=size, mid=mid[3:])
+    else:
+        url = core.COVER_TMPL.format(s=size, mid=mid)
     r = await _http_client().get(url)
     if r.status_code != 200 or not r.content:
         raise SubError(70, f"封面取不到（{r.status_code}）: {url}")
@@ -550,7 +557,200 @@ async def h_get_song(p: dict[str, str]) -> dict[str, Any]:
 
 async def h_get_starred2(p: dict[str, str]) -> dict[str, Any]:
     # 整份「我喜欢」都返回（以前只给 100 首，客户端收藏列表会永远停在 100）
-    return {"starred2": {"song": await _full_mode_songs("fav")}}
+    return {"starred2": {"song": await _full_mode_songs("fav"),
+                         "album": [], "artist": []}}
+
+
+# ------------------------------------------------------------------ 专辑 / 歌手浏览
+#
+# 为什么现在才做：第一版只保证"歌单 + 搜索 + 播放"，客户端的「库」页是空的。
+# 上游库支持 专辑列表/专辑详情/专辑歌曲/歌手列表/歌手专辑/相似歌曲，全部现成，
+# 只是要翻译成 Subsonic 的 album/artist 结构。
+
+_album_cache: dict[str, list[dict[str, Any]]] = {}
+_album_cache_at = 0.0
+_ALBUM_TTL = 600.0
+_artist_names: dict[str, str] = {}
+
+
+def _year(s: Any) -> int:
+    try:
+        return int(str(s)[:4])
+    except Exception:                                        # noqa: BLE001
+        return 0
+
+
+def _index_letter(s: str) -> str:
+    ch = (s or "").strip()[:1].upper()
+    return ch if ch.isascii() and ch.isalpha() else "#"
+
+
+def _song_json_model(song: Any, track: int = 0) -> dict[str, Any] | None:
+    it = core.song_to_item(song)
+    if it is None:
+        return None
+    j = _song_json(it)
+    if track:
+        j["track"] = track
+    return j
+
+
+def _album_json(a: Any, song_count: int = 0) -> dict[str, Any]:
+    singers = getattr(a, "singers", None) or []
+    artist = " / ".join(getattr(s, "name", "") for s in singers)         or getattr(a, "singer_name", "") or ""
+    mid = getattr(a, "mid", "") or ""
+    count = song_count or int(getattr(a, "total_num", 0) or 0)         or int(getattr(a, "songnum", 0) or 0)
+    return {
+        "id": mid,
+        "name": getattr(a, "name", "") or getattr(a, "title", ""),
+        "artist": artist,
+        "coverArt": mid or "none",
+        "songCount": count,
+        "duration": 0, "playCount": 0, "created": _iso(0),
+        "year": _year(getattr(a, "time_public", "") or getattr(a, "release_time", "")),
+    }
+
+
+async def h_get_album_list2(p: dict[str, Any]) -> dict[str, Any]:
+    """专辑列表：newest/recent/random 用 QQ「新碟上架」；其余类型返回空（不报错）。"""
+    typ = str(p.get("type") or "newest").lower()
+    try:
+        size = int(p.get("size") or 20)
+        offset = int(p.get("offset") or 0)
+    except ValueError:
+        size, offset = 20, 0
+    size = max(1, min(size, 100))
+    if typ not in ("newest", "recent", "random"):
+        return {"albumList2": {"album": []}}
+    global _album_cache, _album_cache_at
+    now = time.time()
+    try:
+        if not _album_cache or now - _album_cache_at > _ALBUM_TTL:
+            resp = await core._state["client"].album.get_new_album(area=1, num=100, page=1)
+            albums = getattr(resp, "albums", None) or []
+            _album_cache = [_album_json(a) for a in albums if getattr(a, "mid", "")]
+            _album_cache_at = now
+            log.info("新碟上架缓存 %d 张", len(_album_cache))
+    except Exception as e:                                   # noqa: BLE001
+        log.warning("取新碟上架失败: %s", e)
+        return {"albumList2": {"album": []}}
+    albums = list(_album_cache)
+    if typ == "random":
+        random.shuffle(albums)
+    page = albums[offset:offset + size]
+    return {"albumList2": {"album": page}}
+
+
+async def h_get_album(p: dict[str, Any]) -> dict[str, Any]:
+    mid = p.get("id") or ""
+    if not mid:
+        raise SubError(10, "缺少 id 参数")
+    name, artists, year = "", "", 0
+    try:
+        detail = await core._state["client"].album.get_detail(mid)
+        album = getattr(detail, "album", None)
+        if album is not None:
+            name = getattr(album, "name", "") or getattr(album, "title", "")
+            year = _year(getattr(album, "time_public", ""))
+        artists = " / ".join(getattr(s, "name", "")
+                             for s in (getattr(detail, "singers", None) or []))
+    except Exception as e:                                   # noqa: BLE001
+        log.warning("专辑详情失败 %s: %s", mid, e)
+
+    items: list[dict[str, Any]] = []
+    total = 0
+    try:
+        for page in range(1, 11):
+            r = await core._state["client"].album.get_song(mid, num=100, page=page)
+            batch = getattr(r, "song_list", None) or []
+            total = int(getattr(r, "total_num", 0) or 0)
+            for s in batch:
+                j = _song_json_model(s, track=len(items) + 1)
+                if j:
+                    items.append(j)
+            if len(batch) < 100 or (total and len(items) >= total):
+                break
+    except Exception as e:                                   # noqa: BLE001
+        raise SubError(70, f"取专辑歌曲失败: {e}") from e
+    if not items:
+        raise SubError(70, f"专辑里没有可播的歌: {mid}")
+    return {"album": {"id": mid, "name": name or mid, "artist": artists,
+                      "coverArt": mid, "songCount": len(items), "duration": 0,
+                      "playCount": 0, "created": _iso(0), "year": year, "song": items}}
+
+
+async def h_get_artists(p: dict[str, Any]) -> dict[str, Any]:
+    """歌手列表（QQ「热门歌手」，按首字母分组）。"""
+    try:
+        resp = await core._state["client"].singer.get_singer_list_index(page=1, num=100)
+    except Exception as e:                                   # noqa: BLE001
+        log.warning("取歌手列表失败: %s", e)
+        return {"artists": {"ignoredArticles": "", "index": []}}
+    groups: dict[str, list[dict[str, Any]]] = {}
+    for s in getattr(resp, "singerlist", None) or []:
+        mid = getattr(s, "mid", "") or ""
+        if not mid:
+            continue
+        name = getattr(s, "name", "") or getattr(s, "title", "")
+        _artist_names[mid] = name
+        letter = _index_letter(getattr(s, "spell", "") or name)
+        groups.setdefault(letter, []).append(
+            {"id": mid, "name": name, "albumCount": 0, "coverArt": "ar_" + mid})
+    return {"artists": {"ignoredArticles": "",
+                        "index": [{"name": k, "artist": v} for k, v in sorted(groups.items())]}}
+
+
+async def h_get_artist(p: dict[str, Any]) -> dict[str, Any]:
+    mid = p.get("id") or ""
+    if not mid:
+        raise SubError(10, "缺少 id 参数")
+    albums: list[dict[str, Any]] = []
+    try:
+        r = await core._state["client"].singer.get_album_list(mid, num=30, page=1)
+        for a in getattr(r, "album_list", None) or []:
+            if getattr(a, "mid", ""):
+                albums.append(_album_json(a, int(getattr(a, "total_num", 0) or 0)))
+    except Exception as e:                                   # noqa: BLE001
+        log.warning("取歌手专辑失败 %s: %s", mid, e)
+    return {"artist": {"id": mid, "name": _artist_names.get(mid, mid),
+                       "albumCount": len(albums), "coverArt": "ar_" + mid,
+                       "album": albums}}
+
+
+async def h_get_artist_info2(p: dict[str, Any]) -> dict[str, Any]:
+    # 第一版不给简介/相似歌手（客户端会显示空，不会报错）
+    return {"artistInfo2": {"biography": "", "musicBrainzId": "",
+                            "lastFmUrl": "", "smallImageUrl": "",
+                            "mediumImageUrl": "", "largeImageUrl": "",
+                            "similarArtist": []}}
+
+
+async def h_get_similar_songs2(p: dict[str, Any]) -> dict[str, Any]:
+    mid = p.get("id") or ""
+    try:
+        count = int(p.get("count") or 20)
+    except ValueError:
+        count = 20
+    count = max(1, min(count, 50))
+    song = await core.fetch_song(mid)
+    sid = int(getattr(song, "id", 0) or 0)
+    if not sid:
+        raise SubError(70, f"拿不到 {mid} 的数字 id")
+    try:
+        resp = await core._state["client"].song.get_similar_song(sid)
+    except Exception as e:                                   # noqa: BLE001
+        raise SubError(70, f"取相似歌曲失败: {e}") from e
+    out: list[dict[str, Any]] = []
+    for g in getattr(resp, "song", None) or []:
+        for s in getattr(g, "song", None) or []:
+            j = _song_json_model(s)
+            if j and j["id"] != mid:
+                out.append(j)
+            if len(out) >= count:
+                break
+        if len(out) >= count:
+            break
+    return {"similarSongs2": {"song": out}}
 
 
 async def h_get_random(p: dict[str, str]) -> dict[str, Any]:
@@ -568,11 +768,12 @@ async def h_get_playlists(p: dict[str, Any]) -> dict[str, Any]:
     再加上客户端自己建的服务端歌单（data/playlists.json）。
     """
     owner = next(iter(_users), "")
-    items: list[dict[str, Any]] = [
-        {"id": m["mode"], "name": m["name"], "owner": owner,
-         "public": False, "songCount": 0, "created": _iso(0), "changed": _iso(0)}
-        for m in core.MODES
-    ]
+    items: list[dict[str, Any]] = []
+    for m in core.MODES:
+        hit = _pc.get(m["mode"])
+        items.append({"id": m["mode"], "name": m["name"], "owner": owner,
+                      "public": False, "songCount": len(hit[1]) if hit else 0,
+                      "created": _iso(0), "changed": _iso(0)})
     for pid, rec in _pl_load().items():
         items.append({"id": pid, "name": rec.get("name") or pid, "owner": owner,
                       "public": False, "songCount": len(rec.get("items") or []),
@@ -615,6 +816,13 @@ def _force_https(url: str) -> str:
 
 
 async def h_stream(p: dict[str, str]) -> Response:
+    async with guard.stream_slot() as slot:
+        if not slot.ok:
+            raise SubError(50, "同时取流过多，稍后再试")
+        return await _stream_inner(p)
+
+
+async def _stream_inner(p: dict[str, str]) -> Response:
     mid = p.get("id") or ""
     if not mid:
         raise SubError(10, "缺少 id 参数")
@@ -750,8 +958,10 @@ _HANDLERS: dict[str, Callable[[dict[str, str]], Any]] = {
     "getAvatar": h_get_avatar,
     "getIndexes": h_get_indexes,
     "getArtists": h_get_artists,
-    "getArtist": h_empty_list,
-    "getAlbum": h_empty_list,
+    "getArtist": h_get_artist,
+    "getAlbum": h_get_album,
+    "getArtistInfo2": h_get_artist_info2,
+    "getSimilarSongs2": h_get_similar_songs2,
     "getAlbumList": h_get_album_list2,
     "getAlbumList2": h_get_album_list2,
     "getSong": h_get_song,
@@ -811,6 +1021,13 @@ def _sanitize(p: dict[str, str]) -> dict[str, str]:
 
 async def _handle(request: Request, method: str) -> Response:
     p = await _params(request)
+    ip = guard.client_ip(request)
+    # ★ 防护：被封 / 超速 → Subsonic error 50（客户端会显示"太频繁"而不是密码错）
+    if guard.blocked(ip):
+        log.warning("已封禁 IP 仍在请求: %s %s", ip, method)
+        return _failed(50, "请求过于频繁，已被暂时封禁，请稍后再试")
+    if method not in ("getCoverArt", "getAvatar") and not guard.allow(ip):
+        return _failed(50, "请求过于频繁，请稍后再试")
     try:
         _auth(request, p)
 
@@ -842,6 +1059,7 @@ async def _handle(request: Request, method: str) -> Response:
         return _ok(payload)
     except SubError as e:
         if e.code in (40, 41, 42, 43):
+            guard.note_auth_fail(ip)
             # ★ 鉴权失败的诊断日志：**不记密码/令牌**，只记"客户端用了哪种方式、账号是什么"。
             #   真实客户端五花八门（token / enc: / Basic / 空密码），没这条日志只能瞎猜。
             log.warning("鉴权失败 %s: u=%r t=%s s=%s p=%r basic=%s cookie=%s ua=%r query=%s",

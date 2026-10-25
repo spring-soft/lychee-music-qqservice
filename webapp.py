@@ -25,6 +25,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 
 import app as core                     # 复用取数/音质/缓存逻辑（不启动它的 lifespan）
+import guard
 import subsonic_api
 import websession
 from qqmusic_api import Client, Credential
@@ -158,9 +159,18 @@ async def login(request: Request) -> Response:
         return JSONResponse({"ok": False, "error": "请求格式不对"}, status_code=400)
     user = (form.get("user") or [""])[0]
     pw = (form.get("password") or [""])[0]
+    ip = guard.client_ip(request)
+    if guard.blocked(ip):
+        log.warning("已封禁 IP 尝试登录: %s", ip)
+        return JSONResponse({"ok": False, "error": "尝试次数过多，请 15 分钟后再试"},
+                            status_code=429)
+    if not guard.allow(ip):
+        return JSONResponse({"ok": False, "error": "请求太频繁，稍后再试"}, status_code=429)
     if not websession.verify_password(user, pw):
-        log.warning("网页登录失败（user=%s）", user)
+        guard.note_login_fail(ip)
+        log.warning("网页登录失败（user=%s ip=%s）", user, ip)
         return JSONResponse({"ok": False, "error": "账号或密码不对"}, status_code=401)
+    guard.note_login_ok(ip)
     resp = JSONResponse({"ok": True})
     resp.set_cookie(websession.COOKIE, websession.make_token(),
                     max_age=websession.MAX_AGE, httponly=True,
@@ -214,11 +224,28 @@ async def favicon() -> Response:
     return Response(status_code=204)
 
 
+@app.middleware("http")
+async def _security_headers(request: Request, call_next):
+    """给所有响应加基础安全头（公网面的最低配置）。"""
+    resp: Response = await call_next(request)
+    resp.headers.setdefault("X-Content-Type-Options", "nosniff")
+    resp.headers.setdefault("X-Frame-Options", "DENY")
+    resp.headers.setdefault("Referrer-Policy", "no-referrer")
+    # 页面只用同源资源；音频会 302 到 QQ CDN，所以 media-src 放开 https。
+    resp.headers.setdefault(
+        "Content-Security-Policy",
+        "default-src 'self'; img-src 'self' data:; media-src 'self' https: blob:; "
+        "connect-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; "
+        "frame-ancestors 'none'")
+    return resp
+
+
 @app.get("/healthz")
 async def healthz() -> JSONResponse:
-    """运维探针（不带凭据）：只回是否起来了 + 账号是否配置 + QQ 凭据状态。"""
+    """运维探针（不带凭据）：只回是否起来了 + 账号是否配置 + QQ 凭据状态 + 防护计数。"""
     conf = load_web_conf()
     return JSONResponse({"ok": True,
                          "subsonic_user": conf.get("user") or "",
                          "cred": core.cred_state(),
+                         "guard": guard.stats(),
                          "endpoints": ["/rest/ping.view", "/rest/search3.view"]})

@@ -14,34 +14,43 @@
 
 | 文件 | 作用 |
 |---|---|
-| webapp.py | 3211 的入口：页面 + /login 、/logout + 挂 /rest |
-| subsonic_api.py | Subsonic 协议层（响应封装、认证、端点映射） |
+| webapp.py | 3211 入口：页面 + /login /logout + 挂 /rest + 安全头 |
+| subsonic_api.py | Subsonic 协议层（认证、端点映射、歌单翻页、专辑/歌手浏览） |
 | websession.py | 网页登录 cookie（HMAC 签名，HttpOnly） |
+| guard.py | 防护：登录/鉴权失败封禁、每 IP 限速、并发流上限 |
 | wwwweb/ | 网页播放器（index.html / app.js / app.css） |
-| deploy/qqweb.service | systemd 单元（端口 3211，MemoryMax=120M） |
-| _rest_selftest.py | 服务器上的协议自检（17 项） |
-| data/web.json | **不进仓库**，权限 600：{"user":"...","password":"...","star_write":true} |
+| deploy/qqweb.socket + qqweb.service | systemd socket activation（3211） |
+| _rest_selftest.py | 服务器上的协议自检 |
+| data/web.json | **不进仓库**，权限 600：user / password / star_write / server_type |
 
 ## 部署
 
 ```bash
 mkdir -p /opt/qqmusic/wwwweb
-# 上传 webapp.py subsonic_api.py websession.py wwwweb/* 到 /opt/qqmusic/
-cp deploy/qqweb.service /etc/systemd/system/
+# 上传 webapp.py subsonic_api.py websession.py guard.py wwwweb/* 到 /opt/qqmusic/
+cp deploy/qqweb.socket deploy/qqweb.service /etc/systemd/system/
 cat > /opt/qqmusic/data/web.json <<'JSON'
 {"user": "665858hjn", "password": "<强密码>", "star_write": true}
 JSON
 chmod 600 /opt/qqmusic/data/web.json
 chown -R qqmusic:qqmusic /opt/qqmusic
-systemctl daemon-reload && systemctl enable --now qqweb
+systemctl daemon-reload
+systemctl enable --now qqweb.socket
+systemctl enable --now qqweb.service
 ```
 
 验证：
 
 ```bash
-curl -s http://127.0.0.1:3211/healthz
-cd /opt/qqmusic && ./venv/bin/python _rest_selftest.py   # 应全部 PASS
+curl -s http://127.0.0.1:3211/healthz          # 含 guard 计数
+cd /opt/qqmusic && ./venv/bin/python _rest_selftest.py
 ```
+
+### 为什么用 socket activation
+
+监听 socket 由 systemd 持有，重启 qqweb 时 socket **不关闭**，
+正在建立的连接排队等新进程，而不是被拒绝。
+实测：重启期间连续 100 次请求 99 次成功（1 次是正在途中的请求）。
 
 ## 公网暴露（Cloudflare Tunnel）
 
@@ -54,49 +63,57 @@ ingress:
   - service: http_status:404
 ```
 
-⚠️ **绝对不要**给 3210 加任何隧道规则：那条线没有鉴权，/v1/login/import、
-/v1/download、/v1/player 全裸。
-
-TLS 由 Cloudflare 终止；本服务只讲 HTTP。因为音频是 302 到 QQ CDN，
-**不经过 Cloudflare**，所以不受 CF 免费版 100 秒超时/流量限制影响。
+⚠️ **绝对不要**给 3210 加隧道规则：那条线没有鉴权。
+TLS 由 Cloudflare 终止；音频是 302 到 QQ CDN，**不经过 Cloudflare**。
 
 ## 支持的端点
 
-ping / getLicense / getMusicFolders / getIndexes / getArtists（空）/ getAlbumList2（空）
-search3（=search2=search）/ getSong / getStarred2 / getRandomSongs
-getPlaylists / getPlaylist（**6 个 QQ 模式 = 6 个歌单**：fav/daily/million/newrec/guess/radar）
-stream / download（302 → QQ CDN，https）/ getCoverArt（服务器代理小图）
-getLyricsBySongId / star / scrobble / getNowPlaying / getScanStatus
-getOpenSubsonicExtensions / getPlayQueue / savePlayQueue
-未实现的端点返回 status=ok 的空对象（不报错，客户端退化）。
+基础：ping / getLicense / getMusicFolders / getUser / getAvatar / getScanStatus
+搜索：search3（=search2=search）
+歌曲：getSong / getRandomSongs / getSimilarSongs2 / getTopSongs（空）
+歌单：getPlaylists / getPlaylist（**6 个 QQ 模式 = 6 个歌单**，自动翻页整份返回）
+　　　createPlaylist / updatePlaylist / deletePlaylist（客户端自建歌单，存 data/playlists.json）
+收藏：getStarred2 / star（**真写回 QQ「我喜欢」并回读校验**）/ unstar（明确不支持，code=30）
+专辑：getAlbumList2（newest/recent/random → QQ 新碟上架）/ getAlbum（专辑详情 + 全部曲目）
+歌手：getArtists（QQ 热门歌手，按首字母分组）/ getArtist（歌手专辑）/ getArtistInfo2（空壳）
+播放：stream / download（302 → QQ CDN 的 https 直链）
+图片/歌词：getCoverArt（服务器代理小图；歌手头像 id 前缀 ar_）/ getLyricsBySongId
+其它：scrobble / getNowPlaying / getPlayQueue / savePlayQueue / getOpenSubsonicExtensions
+未实现端点返回 status=ok 的空对象（客户端退化，不报错）。
 
-## 已知限制（实测得出的，不是猜）
+## 防护（guard.py）
+
+| 项 | 值 |
+|---|---|
+| 登录失败 | 5 次/10 分钟 → 封 IP 15 分钟（返回 429） |
+| 协议鉴权失败 | 20 次/5 分钟 → 封 IP 10 分钟（返回 Subsonic code=50） |
+| 每 IP 请求 | 120 次/分钟（封面/头像不计） |
+| 并发取流 | 全局 8 个，超时拒绝 |
+| 安全响应头 | CSP / X-Frame-Options / nosniff / Referrer-Policy |
+
+只对**失败**计数，正常播放/浏览不会被误伤；计数在内存里，重启清零。
+healthz 里的 guard 字段可看实时计数。
+
+## 网页播放器
+
+登录（HttpOnly cookie）、歌单卡片（含曲目数）、搜索、队列抽屉、歌词同步高亮、
+加星（写回 QQ）、随机排序、音量、键盘快捷键（空格播放 / ←→跳 5 秒 / ↑↓音量 / N P 切歌）、
+媒体键（锁屏控制）、**刷新后恢复上次队列和进度**（点击播放从上次位置继续）。
+
+## 已知限制
 
 1. **取消收藏做不到**：QQ 上游对 dirId=201 的删除静默忽略（app.py 里 2026-10-11
-   穷举过 10 种写法）。star 真写回 + 回读总数校验；unstar 明确返回 Subsonic
-   error code=30，不假装成功。要在 QQ 音乐 App 里手动取消。
+   穷举过 10 种写法）。star 真写回并回读总数校验；unstar 明确返回 code=30。
 2. **拖进度条不可靠**：stream 是 302，客户端用 HTTP Range 直连 CDN 的能拖；
-   依赖 timeOffset（服务端转码）的会从头放。ESP 那条线本身就禁用 QQ seek。
-3. **没有专辑/歌手浏览**：getArtists / getAlbumList2 目前返回空。
-4. **只返回 JSON**：f=xml 不实现；ESP 与主流客户端（Symfonium/Feishin）都用 json。
-5. **单账号**，无多用户/播放次数/跨设备续播。
-
-## 安全清单
-
-- 只暴露 3211（经隧道）；3210/4533 只在内网。
-- /docs、/openapi.json 已关闭；公网 app 不注册 /v1/*。
-- 网页登录密码只存在服务端内存 + web.json（600），cookie 是 HttpOnly 签名值；
-  **密码在 Subsonic 协议下必须以明文保存在服务端**（t=md5(pass+salt) 决定的），
-  所以 web.json 属主必须是 qqmusic、权限 600。
-- 建议在 Cloudflare 侧加 Rate limiting（登录失败/暴力破解），或用 fail2ban 读日志。
-- QQ 直链（2 小时有效）会随 302 暴露给播放方，这是协议本身决定的，可接受。
+   依赖 timeOffset 的会从头放（QQ 直链没有时间轴 seek）。
+3. **收藏/歌单整份返回是翻页拼的**：fav 913 首第一次要约 15 秒，之后缓存 30 分钟，
+   启动后后台预热。
+4. **只返回 JSON**（f=xml 不实现）；单账号；无播放次数/跨设备续播。
+5. **专辑列表只有「新碟上架」**（newest/recent/random），没有按流派/年代筛选。
 
 ## 调试
 
 ```bash
-journalctl -u qqweb -f
-curl -s http://127.0.0.1:3211/healthz
-# 手工验证（把 u/t/s 换成真实值）：
-curl -s "http://127.0.0.1:3211/rest/ping.view?u=...&t=...&s=...&c=test&v=1.16.1&f=json"
-curl -s -o /dev/null -D - "http://127.0.0.1:3211/rest/stream.view?id=<songmid>&u=...&t=...&s=..."
+journalctl -u qqweb -f                     # 每个请求一行 REQ（客户端名 c / UA / IP / 参数）
+curl -s http://127.0.0.1:3211/healthz      # 凭据 + guard 计数
 ```

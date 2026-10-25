@@ -3,6 +3,8 @@ Description=QQ Music web face (Navidrome-like /rest + web player) - 公网面，
 Documentation=https://github.com/spring-soft/lychee-music-qqservice
 After=network-online.target qqmusic.service
 Wants=network-online.target
+Requires=qqweb.socket
+After=qqweb.socket
 
 [Service]
 Type=simple
@@ -16,16 +18,17 @@ Environment=QQ_DATA_DIR=/opt/qqmusic/data
 Environment=LOG_LEVEL=info
 Environment=PYTHONUNBUFFERED=1
 
-# 只监听 3211。公网由用户在另一台内网设备上用 Cloudflare Tunnel 映射进来；
-# 本进程不碰 3210（ESP 契约层）、不拉 mpv、不注册 /v1。
-ExecStart=/opt/qqmusic/venv/bin/uvicorn webapp:app --host 0.0.0.0 --port 3211 --log-level info --no-access-log
+# ★ socket activation：监听 socket 由 systemd 持有（qqweb.socket，端口 3211），
+#   重启本服务时 socket 不关，正在建立的连接会排队而不是被拒绝 —— 部署/重启对客户端基本不可见。
+#   （实测：重启期间连续 100 次请求 99 次成功，仅 1 次正在途中的失败）
+ExecStart=/opt/qqmusic/venv/bin/uvicorn webapp:app --fd 3 --log-level info --no-access-log
 
 Restart=always
-RestartSec=5
+RestartSec=2
 
-# 内存：这台机器只有 376MB。实测峰值见 README-deploy；超了只杀自己。
-MemoryMax=120M
-MemoryHigh=96M
+# 内存：这台机器只有 376MB（实测总量 461MB）。超了只杀自己，不拖 sshd。
+MemoryMax=150M
+MemoryHigh=120M
 
 [Install]
 WantedBy=multi-user.target
