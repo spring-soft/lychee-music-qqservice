@@ -1,0 +1,31 @@
+[Unit]
+Description=QQ Music web face (Navidrome-like /rest + web player) - 公网面，单位置 3211
+Documentation=https://github.com/spring-soft/lychee-music-qqservice
+After=network-online.target qqmusic.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/qqmusic
+
+# 与 qqmusic.service 同一个非 root 用户：需要读 data/credential.json（QQ 登录态，600）
+User=qqmusic
+Group=qqmusic
+
+Environment=QQ_DATA_DIR=/opt/qqmusic/data
+Environment=LOG_LEVEL=info
+Environment=PYTHONUNBUFFERED=1
+
+# 只监听 3211。公网由用户在另一台内网设备上用 Cloudflare Tunnel 映射进来；
+# 本进程不碰 3210（ESP 契约层）、不拉 mpv、不注册 /v1。
+ExecStart=/opt/qqmusic/venv/bin/uvicorn webapp:app --host 0.0.0.0 --port 3211 --log-level info --no-access-log
+
+Restart=always
+RestartSec=5
+
+# 内存：这台机器只有 376MB。实测峰值见 README-deploy；超了只杀自己。
+MemoryMax=120M
+MemoryHigh=96M
+
+[Install]
+WantedBy=multi-user.target
