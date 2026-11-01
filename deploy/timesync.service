@@ -1,0 +1,9 @@
+[Unit]
+Description=Sync system clock via HTTP Date header (无 RTC 电池的 OpenStick)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/opt/qqmusic/timesync.sh
+TimeoutStartSec=60

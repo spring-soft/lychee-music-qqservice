@@ -43,6 +43,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
+import httpx
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 
@@ -65,6 +66,47 @@ import download
 logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO").upper(),
                     format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("qqmusic")
+
+
+# ============================================================================
+# QIMEI 降级补丁（2026-11-01）
+# ============================================================================
+# 背景：QQ 在 2026-11-01 前后改了 QIMEI 代理接口的签名，上游库 0.8.2（也是最新版）
+# 的 /tme/trpc/proxy 请求被拒：{"code":-30000,"msg":"接口鉴权失败"}。
+# 后果：Android 平台请求在 ensure() 阶段抛 RuntimeError → 取 vkey 全失败 → QQ 音乐放不了。
+#
+# 实测（2026-11-01）：取播放地址（music.vkey.GetVkey）**不校验 QIMEI**，
+# 把 QIMEI 传空字符串仍能拿到 result=0 的有效直链。所以这里做兜底：
+#   · 先正常取 QIMEI；
+#   · 失败就返回空值，并且 **1 小时内不再重试**（避免每个请求都等一次失败）；
+#   · 上游将来修好后，缓存过期会自动恢复走正常 QIMEI。
+# ⚠️ 二维码登录等流程可能仍依赖 QIMEI；本补丁只保证「取歌/播放」这条线不断。
+def _patch_qimei_fallback() -> None:
+    try:
+        from qqmusic_api.utils.qimei import QimeiManager
+    except Exception as e:                                   # noqa: BLE001
+        log.warning("QIMEI 补丁跳过（import 失败）: %s", e)
+        return
+    orig = QimeiManager.get_cached
+    state = {"dead_until": 0.0}
+
+    async def patched(self):
+        now = time.time()
+        if now < state["dead_until"]:
+            return {"q16": "", "q36": ""}
+        try:
+            return await orig(self)
+        except Exception as e:                               # noqa: BLE001
+            state["dead_until"] = now + 3600
+            log.warning("QIMEI 接口不可用（%s: %s）→ 降级为空 QIMEI，1 小时内不再重试；"
+                        "取播放直链不受影响", type(e).__name__, str(e)[:120])
+            return {"q16": "", "q36": ""}
+
+    QimeiManager.get_cached = patched
+    log.info("QIMEI 降级补丁已启用")
+
+
+_patch_qimei_fallback()
 
 DATA_DIR = Path(os.environ.get("QQ_DATA_DIR", "/data"))
 CRED_PATH = DATA_DIR / "credential.json"
@@ -504,10 +546,47 @@ async def login_import(payload: dict[str, Any]) -> dict[str, Any]:
 
 # ---------------- 搜索 ----------------
 
+# ★ 2026-11-01 兜底：QQ 改了 QIMEI 接口签名（上游库 0.8.2 被拒 code=-30000），
+#   我们把 QIMEI 降级成空值后，**取播放地址/查详情/歌单都正常，只有搜索返回空列表**。
+#   而 QQ 的公开 web 搜索接口（c.y.qq.com/soso）不依赖登录态，实测可用。
+#   所以搜索失败/为空时走它拿 songmid，再补一次 query_song 取文件信息（size/suffix）。
+WEB_SEARCH_URL = "https://c.y.qq.com/soso/fcgi-bin/client_search_cp"
+WEB_SEARCH_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                  "(KHTML, like Gecko) Chrome/120.0 Safari/537.36",
+    "Referer": "https://y.qq.com/",
+}
+
+
+async def _web_search_mids(q: str, limit: int) -> list[str]:
+    """用 QQ 公开 web 搜索接口拿 songmid 列表（不需要登录态）。"""
+    params = {"format": "json", "p": 1, "n": max(1, min(limit, 30)),
+              "w": q, "cr": 1, "g_tk": 5381, "t": 0}
+    async with httpx.AsyncClient(timeout=15.0, headers=WEB_SEARCH_HEADERS,
+                                 follow_redirects=True) as cli:
+        r = await cli.get(WEB_SEARCH_URL, params=params)
+        if r.status_code != 200:
+            raise RuntimeError(f"web 搜索 HTTP {r.status_code}")
+        data = r.json()
+    lst = ((data.get("data") or {}).get("song") or {}).get("list") or []
+    return [str(s.get("songmid")) for s in lst if s.get("songmid")]
+
+
+async def _web_search_items(q: str, limit: int, quality: str | None) -> list[dict[str, Any]]:
+    """公开 web 搜索 → songmid → query_song 补全（size/suffix/duration）→ 统一 item。"""
+    mids = await _web_search_mids(q, limit)
+    if not mids:
+        return []
+    detail = await _state["client"].song.query_song([SongQueryInfo(mid=m) for m in mids])
+    tracks = getattr(detail, "tracks", None) or []
+    return [it for it in (song_to_item(t, quality) for t in tracks) if it]
+
+
 @app.get("/v1/search")
 async def search(q: str = Query(..., min_length=1), limit: int = 20,
                  quality: str | None = None) -> dict[str, Any]:
     limit = max(1, min(limit, 50))
+    items: list[dict[str, Any]] = []
     try:
         resp = await _state["client"].search.search_by_type(q, SearchType.SONG, num=limit)
         songs = getattr(resp, "song", None) or []
@@ -515,7 +594,16 @@ async def search(q: str = Query(..., min_length=1), limit: int = 20,
     except RatelimitedError as e:
         raise HTTPException(429, f"被限流，稍后再试: {e}") from e
     except Exception as e:                                   # noqa: BLE001
-        raise HTTPException(502, f"上游搜索失败: {type(e).__name__}: {e}") from e
+        log.warning("上游搜索失败（%s: %s）→ 走 web 搜索兜底", type(e).__name__, e)
+
+    if not items:
+        try:
+            items = await _web_search_items(q, limit, quality)
+            log.warning("搜索走 web 兜底：%s -> %d 首", q, len(items))
+        except Exception as e:                               # noqa: BLE001
+            log.warning("web 搜索兜底也失败: %s: %s", type(e).__name__, e)
+            if not items:
+                raise HTTPException(502, f"搜索失败: {type(e).__name__}: {e}") from e
     return {"items": items, "count": len(items)}
 
 

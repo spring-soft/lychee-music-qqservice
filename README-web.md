@@ -117,6 +117,28 @@ cd /opt/qqmusic && ./venv/bin/python credrefresh.py          # 还够用会跳�
 systemctl list-timers credrefresh.timer
 ```
 
+## 系统时间同步（2026-11-01 事故后加）
+
+这台 OpenStick **没有 RTC 电池**，重启后系统时间会回到 1970/旧时间，而 systemd-timesyncd
+在这台机器上起不来（实测 exit-code）。时间不对会导致两个致命后果：
+
+1. QQ 的 QIMEI 接口（/tme/trpc/proxy）按时间戳签名 → 偏差大直接被拒
+   （code=-30000 接口鉴权失败），进而取 vkey 全失败 → QQ 音乐放不了；
+2. 凭据过期判断按本地时间算 → 本地以为还没过期，实际 QQ 侧已过期。
+
+解决：timesync.timer 每 10 分钟 + 开机 20 秒用 **HTTP Date 头**校准系统时间
+（偏差 > 5 秒才改），校准后立刻触发一次 credrefresh。脚本是 deploy/timesync.sh。
+注意：重启后请等 30 秒再判断服务是否正常；timedatectl 的 "System clock synchronized"
+显示 no 是正常的（我们不用 NTP，用 HTTP 校时）。
+
+## QIMEI 降级兜底（2026-11-01）
+
+QQ 于 2026-11-01 前后改了 QIMEI 代理接口的签名，上游库 0.8.2（最新版）请求被拒。
+app.py 顶部 _patch_qimei_fallback() 做了兜底：QIMEI 取不到时传空值并 1 小时不再重试
+（**实测取 vkey 不校验 QIMEI**），保证播放不断。时间校准正常时 QIMEI 会自己恢复，
+补丁只在失败时生效。搜索另有兜底：QQ 搜索接口空 QIMEI 下返回空列表，改用公开
+c.y.qq.com/soso web 搜索拿 songmid 再补详情。
+
 ## 网页播放器
 
 登录（HttpOnly cookie）、歌单卡片（含曲目数）、搜索、队列抽屉、歌词同步高亮、

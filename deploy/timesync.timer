@@ -1,0 +1,11 @@
+[Unit]
+Description=Sync system clock periodically (每 10 分钟 + 开机)
+
+[Timer]
+OnBootSec=20s
+OnUnitActiveSec=10min
+AccuracySec=30s
+Unit=timesync.service
+
+[Install]
+WantedBy=timers.target
