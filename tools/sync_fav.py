@@ -182,7 +182,7 @@ def wait_idle(timeout: int = 1800) -> bool:
     return False
 
 
-def download_pass(missing: list[dict], batch: int) -> tuple[Counter, list[dict], list[dict]]:
+def download_pass(missing: list[dict], batch: int, force: bool = False) -> tuple[Counter, list[dict], list[dict]]:
     """把 missing 分批入队并等完成。返回 (状态计数, 付费无权限清单, 其它失败清单)。"""
     stats: Counter = Counter()
     noauth: list[dict] = []
@@ -195,8 +195,10 @@ def download_pass(missing: list[dict], batch: int) -> tuple[Counter, list[dict],
         wait_idle()
         ids = {it["id"] for it in chunk}
         for it in chunk:
-            r = api_retry(f"{HOST}/v1/download/add?id={urllib.parse.quote(it['id'])}",
-                          tries=2, gap=2)
+            q = f"{HOST}/v1/download/add?id={urllib.parse.quote(it['id'])}"
+            if force:
+                q += "&force=1"      # 跳过下载器三层判重（search3 的模糊匹配会误判"曲库已有"）
+            r = api_retry(q, tries=2, gap=2)
             if "_err" in r:
                 stats["提交失败"] += 1
                 failed.append({"title": it.get("title"), "reason": r["_err"]})
@@ -298,6 +300,8 @@ def main() -> int:
     ap.add_argument("--limit", type=int, default=0, help="最多处理多少首（调试用）")
     ap.add_argument("--no-lyrics", action="store_true", help="跳过补歌词")
     ap.add_argument("--no-check", action="store_true", help="跳过质检")
+    ap.add_argument("--force", action="store_true",
+                    help="强制下载：跳过下载器判重（真缺的歌可能被模糊匹配误判成已有）")
     args = ap.parse_args()
 
     t_start = time.time()
@@ -335,7 +339,7 @@ def main() -> int:
     failed: list[dict] = []
     for p in range(1, max(1, args.passes) + 1):
         log("-- 第 %d/%d 轮下载 --" % (p, args.passes))
-        stats, na, fl = download_pass(missing, args.batch)
+        stats, na, fl = download_pass(missing, args.batch, force=args.force)
         all_stats.update(stats)
         for x in na:
             if x["title"] not in {y["title"] for y in noauth}:
