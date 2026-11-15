@@ -113,3 +113,26 @@ sync-fav
 ```
 
 它会重新比对：**已入库的自动跳过**，只尝试仍缺的那些（含上次的付费单曲）。
+
+---
+
+## 同步成 Navidrome 歌单（保序）
+
+除了把歌下进曲库，还可以把 QQ 收藏**按原顺序**做成 Navidrome 歌单：
+
+```bash
+sync-fav-playlist --dry-run    # 只看会写多少首
+sync-fav-playlist              # 真写（歌单名默认「收藏」，已存在会先删再建）
+sync-fav-playlist --name QQ收藏 --no-star
+```
+
+- 脚本：`/opt/qqmusic/sync_fav_playlist.py`（仓库 `tools/sync_fav_playlist.py`）
+- 顺序：严格按 `/v1/list?mode=fav` 的分页顺序（= QQ App 收藏列表顺序）
+- 只收录曲库里**真的有**的歌，缺的会列出来（先 `sync-fav` 补齐再跑本脚本）
+- 顺手把这 849 首打上星标（Navidrome「收藏/Favorites」也是它们）
+- 报告：`/opt/qqmusic/data/fav_playlist_report.json`
+
+⚠️ **关键坑**：分批 `createPlaylist` / `updatePlaylist(songIdToAdd)` 写入时 Navidrome 是"前插"，
+分批写会把顺序整体弄反（第一版做出来就是反的：QQ 第一首跑到了最后）。
+现在**一次性 POST 写入全部 songId**，写完回读校验（`getPlaylist` 在这台机器上一次返回全部条目）。
+
