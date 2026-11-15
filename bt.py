@@ -84,8 +84,15 @@ def _run(args: list[str], timeout: float = 30.0) -> tuple[int, str]:
 
 
 def alsa_device(addr: str) -> str:
-    """mpv --audio-device 用的字符串（ALSA bluealsa 插件直接支持这个写法）。"""
-    return f"alsa/bluealsa:DEV={addr},PROFILE=a2dp"
+    """mpv --audio-device 用的字符串。
+
+    ★ 2026-11-15 实测结论：bluealsa 那条路（alsa/bluealsa:DEV=...）在本机推 A2DP
+      永远是"假推流"（状态 RUNNING、音箱没声/灯不闪）。改用 PulseAudio：
+      PA 的 bluez5 模块建立 bluez_sink.<MAC>.a2dp_sink，实测能真正出声。
+      所以这里返回 pulse/<sink>，并且播放器会用 --ao=pulse。
+    """
+    key = addr.replace(":", "_").upper()
+    return f"pulse/bluez_sink.{key}.a2dp_sink"
 
 
 def _parse_info(txt: str) -> dict[str, Any]:
@@ -125,6 +132,16 @@ def _pcm_exists(addr: str) -> bool:
 
 # ------------------------------------------------------------------ 对外动作
 
+def _sh(args: list[str]) -> str:
+    """跑本地命令（pactl 等，走 PULSE_SERVER 环境变量；失败返回空串）。"""
+    env = dict(os.environ)
+    env.setdefault("PULSE_SERVER", "unix:/var/run/pulse/native")
+    try:
+        return subprocess.run(args, capture_output=True, text=True, timeout=10, env=env).stdout
+    except Exception:                                       # noqa: BLE001
+        return ""
+
+
 def status() -> dict[str, Any]:
     st = _load()
     cur: dict[str, Any] | None = None
@@ -152,12 +169,21 @@ async def connect(addr: str | None = None, wait_s: float = 15.0) -> dict[str, An
     info = device_info(addr)
     if not info.get("connected"):
         raise HTTPException(502, f"连不上蓝牙音箱（{info.get('name') or addr}）：{log_txt[:80]}")
-    # 等 bluealsa 把 PCM 端口开出来（通常 1~3 秒）
+    # 等 PulseAudio 建出 bluez sink（通常 1~5 秒），然后把它设成默认、硬件音量 100%
+    # ★ 为什么用 PA 而不是 bluealsa：bluealsa 在本机是"假推流"（状态 RUNNING 但
+    #   音箱收不到、灯不闪）；PA 的 bluez5 实测能真正出声。
+    # ★ 音量：sink 有 HW_VOLUME_CTRL，设 100% = 直接设音箱硬件音量（等效手机那个
+    #   "手机和音箱音量相同"选项）；绝不超 100%，也不要加数字增益（会破音）。
+    sink = "bluez_sink." + addr.replace(":", "_").upper() + ".a2dp_sink"
     t0 = time.time()
     while time.time() - t0 < wait_s:
-        if _pcm_exists(addr):
+        r = _sh(["pactl", "list", "short", "sinks"])
+        if sink in r:
             break
-        await asyncio.sleep(0.4)
+        await asyncio.sleep(0.5)
+    _sh(["pactl", "set-default-sink", sink])
+    _sh(["pactl", "set-sink-mute", sink, "0"])
+    _sh(["pactl", "set-sink-volume", sink, "100%"])
     st["last_addr"] = addr
     st["last_name"] = info.get("name") or st.get("last_name") or ""
     _save(st)

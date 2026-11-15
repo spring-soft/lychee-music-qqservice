@@ -199,7 +199,12 @@ class Mpv:
             #   这台机器一天下来能写到十几 MB —— eMMC 写放大不值当。
             #   警告/错误才是排查播放问题要的，正常流程由我们自己的日志覆盖。
             f"--log-file={MPV_LOG}", "--msg-level=all=warn",
-            "--ao=alsa", f"--audio-device={self.device}",
+            # 蓝牙音箱走 PulseAudio（bluealsa 实测推不出声），其它走 ALSA
+            ("--ao=pulse" if str(self.device).startswith("pulse/") else "--ao=alsa"),
+            f"--audio-device={self.device}",
+            # ⚠️ 不要给蓝牙加数字增益（实测 +10dB 会削波破音）。
+            #    蓝牙音量靠 PulseAudio 的 HW_VOLUME_CTRL 直接设音箱硬件音量，
+            #    节目音量仍用播放器自己的 volume（默认 20 左右就够响）。
             f"--volume={self.volume}",
             "--audio-exclusive=no",                     # 留给 amixer/别人的余地
             # 网络流的缓冲。
