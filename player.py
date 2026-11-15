@@ -58,6 +58,8 @@ from typing import Any, Awaitable, Callable
 from urllib.parse import urlencode
 
 import httpx
+
+import bt as btmod
 from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import RedirectResponse, Response
 
@@ -72,6 +74,8 @@ DEFAULT_CFG: dict[str, Any] = {
     # USB DAC（TTGK ECHO-A）实测支持 S16_LE / S24_3LE / S32_LE，44.1k~384k
     "device": "alsa/hw:CARD=ECHOA,DEV=0",
     "volume": 80,
+    # 音频输出目标：dac=USB DAC（默认）/ bt=蓝牙音箱。切换走 POST /v1/player/audio
+    "audio_target": "dac",
     "nav": {"host": "http://127.0.0.1:4533", "user": "", "password": ""},
 }
 
@@ -511,6 +515,9 @@ class Player:
         self.gen = 0
         self.error: str | None = None
         self.volume = int(cfg.get("volume", 80))
+        # ---- 音频输出目标：DAC / 蓝牙音箱（互斥；切走时要把另一个断开）----
+        self.dac_device = str(cfg.get("device") or DEFAULT_CFG["device"])
+        self.audio_target = "bt" if str(cfg.get("audio_target") or "dac") == "bt" else "dac"
         self._err_streak = 0
         # ---- USB DAC 热插拔状态（见文件上部 dac_present() 的说明）----
         self.dac_ok = True               # DAC 现在在不在
@@ -655,6 +662,10 @@ class Player:
         """mpv 播完一首（或出错）。reason 只有 eof/error 会进来（stop 被过滤掉了）。"""
         # ★ DAC 拔掉引起的 error 不是"播放失败"：
         #   不计入连续失败、也**不要自动切下一首**（切了也一样出不了声，还会把队列刷乱）。
+        if reason == "error" and self.audio_target == "bt":
+            self.error = "蓝牙音箱没有输出（可能断开了，长按 K3 重新连接）"
+            log.warning("%s", self.error)
+            return
         if reason == "error" and not dac_present(self.mpv.device):
             pos = 0
             with contextlib.suppress(Exception):
@@ -701,6 +712,8 @@ class Player:
     async def _dac_watch(self) -> None:
         while True:
             await asyncio.sleep(1.5)
+            if self.audio_target == "bt":
+                continue                      # 蓝牙模式没有 USB DAC，别误判成"拔掉了"
             try:
                 ok = dac_present(self.mpv.device)
             except Exception:                       # noqa: BLE001
@@ -905,6 +918,74 @@ class Player:
         await self.mpv.seek_ms(ms)
         return await self.status()
 
+    async def _apply_saved_target(self) -> None:
+        """开机时把上次的音频目标真正落实。
+
+        为什么要这一步：mpv 的 `--audio-device` 是启动参数，开机总是先用 DAC 设备起；
+        如果 player.json 里记的是 bt，就得在这时候真去连音箱并把 mpv 换过去，
+        连不上（音箱没开/不在范围）就**回落到 DAC**，别让状态和实际输出对不上。
+        """
+        if self.audio_target != "bt":
+            return
+        try:
+            info = await btmod.connect(None)
+            self.mpv.device = info["device"]
+            await self.mpv.restart()
+            self.dac_ok = True
+            log.warning("开机应用上次目标：蓝牙音箱（%s）", info.get("name") or info["addr"])
+        except Exception as e:                              # noqa: BLE001
+            log.warning("开机连蓝牙失败，回落 USB DAC（%s）", e)
+            self.audio_target = "dac"
+            self.cfg["audio_target"] = "dac"
+            save_cfg(self.cfg)
+            self.mpv.device = self.dac_device
+            self.dac_ok = dac_present(self.dac_device)
+
+    async def set_audio_target(self, target: str) -> dict[str, Any]:
+        """切换音频输出：dac=USB DAC / bt=蓝牙音箱。
+
+        · 切到 bt：连"上次连过的音箱"（没配对过就报错，提示去配对），
+          mpv 的输出设备改成 ALSA bluealsa，并把当前这首在原位置接着放
+        · 切到 dac：**主动断开蓝牙**（用户要求：没选蓝牙时服务器不要保持连接）
+        · 切换要重启 mpv（--audio-device 是启动参数），所以会有一两声顿
+        """
+        target = "bt" if target == "bt" else "dac"
+        if target == self.audio_target:
+            return await self.status()
+        idx = self.index
+        pos, paused = 0, False
+        if idx >= 0 and self.mpv.alive:
+            with contextlib.suppress(Exception):
+                tp = await self.mpv.get("time-pos")
+                if tp is not None:
+                    pos = int(float(tp) * 1000)
+                paused = bool(await self.mpv.get("pause"))
+        if target == "bt":
+            info = await btmod.connect(None)          # 连上次那台
+            dev = info["device"]
+            log.warning("音频目标 → 蓝牙音箱（%s / %s）", info.get("name") or "", info["addr"])
+        else:
+            await btmod.disconnect()
+            dev = self.dac_device
+            log.warning("音频目标 → USB DAC（%s）", dev)
+        self.audio_target = target
+        self.cfg["audio_target"] = target
+        save_cfg(self.cfg)
+        self.mpv.device = dev
+        await self.mpv.restart()
+        self.dac_ok = True if target == "bt" else dac_present(dev)
+        self.dac_lost = False
+        self.error = None
+        if 0 <= idx < len(self.queue):
+            try:
+                url = await self._url_of(self.queue[idx])
+                await self.mpv.load(url, start_ms=pos)
+                if paused:
+                    await self.mpv.pause(True)
+            except Exception as e:                      # noqa: BLE001
+                log.warning("切换输出后恢复播放失败: %s", e)
+        return await self.status()
+
     async def set_volume(self, level: int) -> dict[str, Any]:
         level = max(0, min(100, int(level)))
         self.volume = level
@@ -940,11 +1021,15 @@ class Player:
             # ★ USB DAC 在位状态：拔掉时网页/设备能直接显示"插上会自动继续"，
             #   而不是让人以为播放器坏了。
             "dac": {"present": self.dac_ok, "device": self.mpv.device},
+            # 音频输出目标与蓝牙状态（设备/网页显示用）
+            "audio_target": self.audio_target,
+            "bt": {"last": btmod.last(),
+                   "connected": str(self.mpv.device).startswith("alsa/bluealsa")},
         }
         if 0 <= self.index < len(self.queue):
             st["song"] = self.queue[self.index]
             st["dur_ms"] = int(self.queue[self.index].get("dur_ms") or 0)
-        if not self.dac_ok:
+        if self.audio_target == "dac" and not self.dac_ok:
             st["state"] = "paused"
             st["pos_ms"] = self.dac_pos_ms
             st["error"] = self.error or "USB DAC 已拔出（插上会自动继续）"
@@ -1113,6 +1198,13 @@ async def player_cover(id: str = Query(...), back: int = 0, size: int = 300) -> 
                     headers={"Cache-Control": "max-age=86400"})
 
 
+@router.post("/audio")
+async def player_audio(target: str = Query(..., pattern="^(dac|bt)$")) -> dict[str, Any]:
+    """切换音频输出：dac=USB DAC，bt=蓝牙音箱（会自动连上次那台，没配对过会报错）。"""
+    p = get_player()
+    return await p.set_audio_target(target)
+
+
 @router.get("/devices")
 async def player_devices() -> dict[str, Any]:
     """机器上有哪些声卡。只用于调试/以后的设置页 —— 当前固定用 player.json 里的 device。"""
@@ -1157,6 +1249,8 @@ async def startup(qq_item, qq_url, qq_list, qq_search,
         await mpv.start()
     except Exception as e:                              # noqa: BLE001
         log.error("mpv 起不来，服务器播放暂不可用: %s", e)
+    # 上次用的是蓝牙音箱 → 后台去连它并把 mpv 切过去（连不上自动回落 DAC）
+    asyncio.create_task(p._apply_saved_target())
     if nav is not None:
         try:
             await nav.check()

@@ -1,0 +1,46 @@
+#!/bin/bash
+# QQ 音乐服务专用的蓝牙操作 helper（通过 sudoers 只放行这个脚本、只放行这几个子命令）
+#
+# 为什么需要它：bluez 的 org.bluez 接口要 root/polkit 授权，而 qqmusic.service
+# 以 qqmusic 用户运行。与其给服务开大权限，不如只暴露"扫描/连接/断开/查询"四件事。
+#
+# 安装：
+#   install -m 755 qqmusic-bt /usr/local/bin/qqmusic-bt
+#   echo 'qqmusic ALL=(root) NOPASSWD: /usr/local/bin/qqmusic-bt' > /etc/sudoers.d/qqmusic-bt
+#   chmod 440 /etc/sudoers.d/qqmusic-bt
+set -u
+
+cmd="${1:-}"
+[ $# -gt 0 ] && shift
+
+case "$cmd" in
+  scan)
+    secs="${1:-12}"
+    : > /tmp/qqmusic-bt-scan.log
+    # bluetoothctl 在非交互模式下也会打印 [NEW] Device xx 名字，直接用 timeout 限时
+    timeout "$secs" bluetoothctl scan on >>/tmp/qqmusic-bt-scan.log 2>&1 || true
+    ;;
+  info)
+    bluetoothctl info "${1:-}" 2>&1
+    ;;
+  paired)
+    bluetoothctl devices Paired 2>&1
+    ;;
+  connect)
+    a="${1:-}"
+    [ -n "$a" ] || { echo "missing addr" >&2; exit 2; }
+    bluetoothctl trust "$a" >/dev/null 2>&1 || true
+    bluetoothctl connect "$a" 2>&1
+    ;;
+  disconnect)
+    a="${1:-}"
+    [ -n "$a" ] || { echo "missing addr" >&2; exit 2; }
+    bluetoothctl disconnect "$a" 2>&1
+    # 顺手取消信任：否则音箱会自己回连上来（用户要求"没选蓝牙时不要连"）
+    bluetoothctl untrust "$a" >/dev/null 2>&1 || true
+    ;;
+  *)
+    echo "usage: $0 scan|info|paired|connect|disconnect" >&2
+    exit 2
+    ;;
+esac

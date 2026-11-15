@@ -60,6 +60,7 @@ from qqmusic_api.modules.song import SongFileInfo, SongFileType, SongQueryInfo
 # ★ 服务器端播放器（让这台机器接的 USB DAC 自己出声）。
 #   它不 import 本模块（否则循环导入），QQ 那侧的取数逻辑由本文件以**回调**注入，
 #   见文件末尾的 _qq_item / _qq_url / _qq_list。
+import bt as btmod
 import player
 import download
 
@@ -391,6 +392,8 @@ app = FastAPI(title="ESP-Music QQ 契约层", version="1.0", lifespan=lifespan)
 app.include_router(player.router)
 # /v1/download/*（把 QQ 无损下载进 Navidrome 曲库）
 app.include_router(download.router)
+# /v1/bt/*（蓝牙音箱：扫描/连接/断开；供设备端配对页用）
+app.include_router(btmod.router)
 
 
 # ---------------- 网页控制台 ----------------
