@@ -188,8 +188,35 @@ async def _library_dup(meta: dict[str, Any]) -> str | None:
     return None
 
 
+MOUNT_DIR = Path(os.environ.get("QQ_MUSIC_MOUNT", "/mnt/usb"))
+
+
+def _music_mounted() -> bool:
+    try:
+        return os.path.ismount(str(MOUNT_DIR))
+    except OSError:
+        return False
+
+
 def _install(src: Path, name: str) -> bool:
-    """把暂存目录里的成品装进曲库（特权 helper；失败就报错，不假装成功）。"""
+    """把暂存目录里的成品装进曲库（特权 helper；失败就报错，不假装成功）。
+
+    ★★ 曲库盘没挂载时**必须拒绝写入**。实测这块板子的 U 盘会突然掉线再枚举，
+      掉线时 /mnt/usb/music 会退化成**根分区上的普通目录**，继续写就会：
+        · 把歌写进 3.5G 的根分区（几十首就撑爆系统）
+        · Navidrome 扫到空目录，曲库看着"变空"
+      所以先等它 60 秒（多半自己会挂回，另有 usb-watchdog 每 30 秒兜底），
+      还不行就明确失败，别假装成功。
+    """
+    for waited in range(0, 65, 5):
+        if _music_mounted():
+            break
+        log.warning("曲库盘没挂载（%s），等 %d 秒…", MOUNT_DIR, waited)
+        time.sleep(5)
+    if not _music_mounted():
+        log.error("曲库盘没挂载（%s），拒绝写入（否则会写进根分区）", MOUNT_DIR)
+        return False
+
     try:
         p = subprocess.run(["sudo", "-n", INSTALL_HELPER, str(src), name],
                            capture_output=True, text=True, timeout=180)
@@ -199,6 +226,9 @@ def _install(src: Path, name: str) -> bool:
     if p.returncode != 0:
         log.error("装入曲库失败（rc=%d）: %s %s", p.returncode,
                   (p.stdout or "").strip(), (p.stderr or "").strip())
+        return False
+    if not (DL_DIR / name).exists():
+        log.error("装完但目标文件不存在: %s", DL_DIR / name)
         return False
     return True
 
