@@ -7,7 +7,7 @@
     /opt/qqmusic/venv/bin/python /opt/qqmusic/sync_fav_playlist.py --dry-run   # 只看会写多少首
     /opt/qqmusic/venv/bin/python /opt/qqmusic/sync_fav_playlist.py             # 真写
     ... --name 收藏            # 歌单名（默认「收藏」，已存在会先删再建）
-    ... --no-star              # 不顺手打星标
+    ... --star                 # 顺便打星标（默认不打）
 
 ⚠️ 关键坑（2026-11-15 实测）：
   分批 createPlaylist / updatePlaylist(songIdToAdd) 写入时，**Navidrome 是"前插"**，
@@ -84,7 +84,8 @@ def main() -> int:
     ap = argparse.ArgumentParser(description="QQ 收藏 → Navidrome 歌单（保序）")
     ap.add_argument("--name", default=DEFAULT_NAME)
     ap.add_argument("--dry-run", action="store_true")
-    ap.add_argument("--no-star", action="store_true", help="不顺手把歌打星标")
+    ap.add_argument("--star", action="store_true",
+                    help="顺便把歌打星标（默认不打：用户希望只维护歌单，不要动星标）")
     args = ap.parse_args()
 
     # 1) QQ 收藏（顺序）
@@ -173,9 +174,9 @@ def main() -> int:
                 log("  首处差异 第 %d 首: 歌单 %s / 期望 %s" % (i + 1, got[i], ids[i]))
                 break
 
-    # 6) 顺带打星标（让 Navidrome「收藏/Favorites」也是这些歌）
+    # 6) 打星标（**默认不做**；用户要求只用歌单维护顺序，星标由用户自己管）
     starred = 0
-    if not args.no_star:
+    if args.star:
         for i in range(0, len(ids), 50):
             chunk = ids[i:i + 50]
             if nav("star", id=chunk).get("status") != "failed":
