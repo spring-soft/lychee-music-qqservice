@@ -76,6 +76,8 @@ DEFAULT_CFG: dict[str, Any] = {
     "volume": 80,
     # 音频输出目标：dac=USB DAC（默认）/ bt=蓝牙音箱。切换走 POST /v1/player/audio
     "audio_target": "dac",
+    # 每个输出目标各自的音量（用户要求：切设备要跟着切回它自己的音量）
+    "volumes": {"dac": 30, "bt": 20},
     "nav": {"host": "http://127.0.0.1:4533", "user": "", "password": ""},
 }
 
@@ -523,6 +525,11 @@ class Player:
         # ---- 音频输出目标：DAC / 蓝牙音箱（互斥；切走时要把另一个断开）----
         self.dac_device = str(cfg.get("device") or DEFAULT_CFG["device"])
         self.audio_target = "bt" if str(cfg.get("audio_target") or "dac") == "bt" else "dac"
+        # 每个输出目标单独记音量（DAC / 蓝牙各一份，切换时各自恢复）
+        v = cfg.get("volumes") or {}
+        self.volumes = {"dac": int(v.get("dac", cfg.get("volume", 30))),
+                        "bt": int(v.get("bt", 20))}
+        self.volume = self.volumes[self.audio_target]
         self._err_streak = 0
         # ---- USB DAC 热插拔状态（见文件上部 dac_present() 的说明）----
         self.dac_ok = True               # DAC 现在在不在
@@ -979,11 +986,17 @@ class Player:
         self.mpv.device = dev
         await self.mpv.restart()
         self.dac_ok = True if target == "bt" else dac_present(dev)
+        # ★ 切设备 = 切回它自己上次的音量（用户要求：不同设备音量互不干扰）
+        self.volume = self.volumes.get(target, self.volume)
+        self.cfg["volume"] = self.volume
         if target == "bt":
             if self.mpv.alive:
                 with contextlib.suppress(Exception):
                     await self.mpv.set("volume", 100)
             self._set_bt_volume(self.volume)       # 绝对音量同步给音箱
+        elif self.mpv.alive:
+            with contextlib.suppress(Exception):
+                await self.mpv.set("volume", self.volume)
         self.dac_lost = False
         self.error = None
         if 0 <= idx < len(self.queue):
@@ -1021,6 +1034,8 @@ class Player:
     async def set_volume(self, level: int) -> dict[str, Any]:
         level = max(0, min(100, int(level)))
         self.volume = level
+        self.volumes[self.audio_target] = level        # 当前输出记住自己的音量
+        self.cfg["volumes"] = dict(self.volumes)
         if self.audio_target == "bt":
             # 绝对音量：mpv 不衰减，直接调音箱硬件音量
             self._set_bt_volume(level)
@@ -1037,6 +1052,7 @@ class Player:
         return await self.status()
 
     async def _save_volume_soon(self) -> None:
+        self.cfg["volumes"] = dict(self.volumes)
         await asyncio.sleep(3)
         self.cfg["volume"] = self.volume
         save_cfg(self.cfg)
