@@ -979,6 +979,11 @@ class Player:
         self.mpv.device = dev
         await self.mpv.restart()
         self.dac_ok = True if target == "bt" else dac_present(dev)
+        if target == "bt":
+            if self.mpv.alive:
+                with contextlib.suppress(Exception):
+                    await self.mpv.set("volume", 100)
+            self._set_bt_volume(self.volume)       # 绝对音量同步给音箱
         self.dac_lost = False
         self.error = None
         if 0 <= idx < len(self.queue):
@@ -991,10 +996,38 @@ class Player:
                 log.warning("切换输出后恢复播放失败: %s", e)
         return await self.status()
 
+    # ---------------- 蓝牙绝对音量同步 ----------------
+    #
+    # 用户要求（2026-11-16）：像手机"与蓝牙设备音量同步"那样，**只有一个音量**：
+    # 板子/网页上调音量 → 直接改音箱硬件音量（AVRCP），不要两头各自增益。
+    # 实现：蓝牙模式下 mpv 固定 volume=100（不衰减），音量全部交给
+    # PulseAudio sink（它带 HW_VOLUME_CTRL，设多少音箱就是多少）。
+    @staticmethod
+    def _sink_of(device: str) -> str:
+        d = str(device or "")
+        return d[len("pulse/"):] if d.startswith("pulse/") else ""
+
+    def _set_bt_volume(self, level: int) -> None:
+        sink = self._sink_of(self.mpv.device)
+        if not sink:
+            return
+        import subprocess
+        env = dict(os.environ)
+        env.setdefault("PULSE_SERVER", "unix:/var/run/pulse/native")
+        with contextlib.suppress(Exception):
+            subprocess.run(["pactl", "set-sink-volume", sink, f"{max(0, min(100, level))}%"],
+                           capture_output=True, timeout=5, env=env)
+
     async def set_volume(self, level: int) -> dict[str, Any]:
         level = max(0, min(100, int(level)))
         self.volume = level
-        if self.mpv.alive:
+        if self.audio_target == "bt":
+            # 绝对音量：mpv 不衰减，直接调音箱硬件音量
+            self._set_bt_volume(level)
+            if self.mpv.alive:
+                with contextlib.suppress(Exception):
+                    await self.mpv.set("volume", 100)
+        elif self.mpv.alive:
             with contextlib.suppress(Exception):
                 await self.mpv.set("volume", level)
         # 落盘去抖：音量可能是连续拖动，别每次都写 eMMC

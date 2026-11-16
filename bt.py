@@ -183,7 +183,8 @@ async def connect(addr: str | None = None, wait_s: float = 15.0) -> dict[str, An
         await asyncio.sleep(0.5)
     _sh(["pactl", "set-default-sink", sink])
     _sh(["pactl", "set-sink-mute", sink, "0"])
-    _sh(["pactl", "set-sink-volume", sink, "100%"])
+    _sh(["pactl", "set-sink-mute", sink, "0"])
+    # 音量不在这里定死：player.py 会按"绝对音量同步"把当前音量设给音箱
     st["last_addr"] = addr
     st["last_name"] = info.get("name") or st.get("last_name") or ""
     _save(st)
