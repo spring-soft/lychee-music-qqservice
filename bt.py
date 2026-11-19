@@ -175,6 +175,7 @@ async def connect(addr: str | None = None, wait_s: float = 15.0) -> dict[str, An
     # ★ 音量：sink 有 HW_VOLUME_CTRL，设 100% = 直接设音箱硬件音量（等效手机那个
     #   "手机和音箱音量相同"选项）；绝不超 100%，也不要加数字增益（会破音）。
     sink = "bluez_sink." + addr.replace(":", "_").upper() + ".a2dp_sink"
+    card = "bluez_card." + addr.replace(":", "_").upper()
     t0 = time.time()
     while time.time() - t0 < wait_s:
         r = _sh(["pactl", "list", "short", "sinks"])
@@ -183,6 +184,12 @@ async def connect(addr: str | None = None, wait_s: float = 15.0) -> dict[str, An
         await asyncio.sleep(0.5)
     _sh(["pactl", "set-default-sink", sink])
     _sh(["pactl", "set-sink-mute", sink, "0"])
+    # ★ 蓝牙端口延迟补偿 250ms（实测解决"播放一卡一卡"的关键）：
+    #   PA 对蓝牙 sink 的默认缓冲只有 ~42ms，WiFi/蓝牙共存造成的几十毫秒空口
+    #   停顿就直接欠载 → 卡顿。把这个偏移调大后 PA 会多缓存，实测 60 秒 0 欠载。
+    #   ⚠️ pactl 的偏移不随 PA 重启保留，所以每次连接都要重设一次（这里做），
+    #      另外还有 bt-latency.timer 每 30 秒兜底（provision 重启后也能补上）。
+    _sh(["pactl", "set-port-latency-offset", card, "speaker-output", "250000"])
     _sh(["pactl", "set-sink-mute", sink, "0"])
     # 音量不在这里定死：player.py 会按"绝对音量同步"把当前音量设给音箱
     st["last_addr"] = addr
