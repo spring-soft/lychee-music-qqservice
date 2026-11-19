@@ -1,0 +1,21 @@
+# PulseAudio 系统模式（蓝牙音箱输出用）
+# ⚠️ 为什么需要它：mpv 的蓝牙输出走 PulseAudio 的 bluez_sink（bluealsa 实测是"假推流"）。
+#   PA 必须以 system 模式常驻，并且要**开机自启** —— 之前是手工起的，板子一重启就没了，
+#   表现就是"蓝牙音箱连不上/没声音"。
+# 安装：
+#   install -m 644 pulseaudio-system.service /etc/systemd/system/
+#   echo 'load-module module-suspend-on-idle timeout=3' >> /etc/pulse/system.pa
+#   systemctl daemon-reload && systemctl enable --now pulseaudio-system
+[Unit]
+Description=PulseAudio (system mode) for Bluetooth audio
+After=bluetooth.service sound.target
+Before=qqmusic.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/pulseaudio --system --disallow-exit --disallow-module-loading=0 --daemonize=no
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

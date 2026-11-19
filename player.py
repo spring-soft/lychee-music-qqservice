@@ -216,9 +216,9 @@ class Mpv:
             #   实测 cgroup 直接顶到 119.4M/120M（available 只剩 560K），
             #   再放歌就会开始疯狂换页。音频流码率最多 ~1MB/s，
             #   8MiB 预读 ≈ 8 秒，完全够；实测调小后 cgroup 降了 20 多 MB。
-            "--cache=yes", "--cache-secs=10",
-            "--demuxer-readahead-secs=12",
-            "--demuxer-max-bytes=8MiB", "--demuxer-max-back-bytes=2MiB",
+            "--cache=yes", "--cache-secs=30",
+            "--demuxer-readahead-secs=25",
+            "--demuxer-max-bytes=24MiB", "--demuxer-max-back-bytes=4MiB",
             "--network-timeout=20",
             f"--input-ipc-server={self.sock}",
         ]
@@ -897,6 +897,8 @@ class Player:
             self._next_url, self._next_idx = None, -1
             if self.mpv.alive:
                 await self.mpv.stop()
+            if self.audio_target == "bt":
+                self._bt_suspend(True)
         return await self.status()
 
     async def set_pause(self, want: bool) -> dict[str, Any]:
@@ -906,6 +908,8 @@ class Player:
         if idle:
             raise HTTPException(409, "现在没有在放歌")
         await self.mpv.pause(want)
+        if self.audio_target == "bt":
+            self._bt_suspend(want)      # 暂停=挂起蓝牙传输（灯不再闪），恢复=唤醒
         return await self.status()
 
     async def toggle(self) -> dict[str, Any]:
@@ -994,6 +998,7 @@ class Player:
                 with contextlib.suppress(Exception):
                     await self.mpv.set("volume", 100)
             self._set_bt_volume(self.volume)       # 绝对音量同步给音箱
+            self._bt_suspend(False)                # 确保不是挂起状态
         elif self.mpv.alive:
             with contextlib.suppress(Exception):
                 await self.mpv.set("volume", self.volume)
@@ -1019,6 +1024,24 @@ class Player:
     def _sink_of(device: str) -> str:
         d = str(device or "")
         return d[len("pulse/"):] if d.startswith("pulse/") else ""
+
+    def _bt_suspend(self, on: bool) -> None:
+        """暂停/停止时挂起蓝牙 sink，恢复播放时再唤醒。
+
+        ★ 用户反馈（2026-11-19）：服务器暂停后音箱没声音了，但指示灯还在闪
+          —— 说明 PA 仍在往音箱发（静音）数据包，A2DP 流没断。
+          暂停时主动 suspend-sink，PA 就会把这条 A2DP 传输关掉，灯也停；
+          恢复前再 unsuspend 即可（比断开蓝牙快、也不用重连）。
+        """
+        sink = self._sink_of(self.mpv.device)
+        if not sink:
+            return
+        import subprocess
+        env = dict(os.environ)
+        env.setdefault("PULSE_SERVER", "unix:/var/run/pulse/native")
+        with contextlib.suppress(Exception):
+            subprocess.run(["pactl", "suspend-sink", sink, "1" if on else "0"],
+                           capture_output=True, timeout=5, env=env)
 
     def _set_bt_volume(self, level: int) -> None:
         sink = self._sink_of(self.mpv.device)
